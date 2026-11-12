@@ -40,12 +40,16 @@ pub fn key(org: &str, patient: &str) -> String {
 /// Where sessions live, shareable with the FHIR client's bearer source.
 pub type Store = Arc<dyn SessionStore + Send + Sync>;
 
-fn credential_store() -> CredentialStore {
-    let service = std::env::var(KEYCHAIN_SERVICE_ENV)
+/// The keychain service in use: `piekstra.athena`, or the test override.
+pub fn service() -> String {
+    std::env::var(KEYCHAIN_SERVICE_ENV)
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| KEYCHAIN_SERVICE.to_string());
-    CredentialStore::new(service)
+        .unwrap_or_else(|| KEYCHAIN_SERVICE.to_string())
+}
+
+fn credential_store() -> CredentialStore {
+    CredentialStore::new(service())
 }
 
 /// The OS keychain, service `piekstra.athena`.

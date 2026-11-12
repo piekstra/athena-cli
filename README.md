@@ -88,7 +88,10 @@ Tokens are one macOS Keychain item per patient (`piekstra.athena`, account
 else. v0.3.0 moved sign-in onto medical-common's shared SMART library and
 renamed the account from `<practice profile>/<patient>`: a sign-in made with
 v0.2.x is not found by v0.3.0, so sign in again once. `auth logout` revokes
-and removes the old item too.
+and removes the old item too. When that item cannot be read (its Keychain
+prompt was denied), the patient stays listed so `auth logout` can be run
+again, and `security delete-generic-password -s piekstra.athena -a <practice
+profile>/<patient>` removes it by hand.
 
 ## What a patient token sees
 

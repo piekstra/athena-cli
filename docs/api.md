@@ -192,7 +192,11 @@ From the [Token Endpoint][token] page:
 A sign-in is one `pk_med_smart::SmartSession` in the Keychain, account
 `smart/<profile>/<patient>`. v0.2.x used `<profile>/<patient>`: such an item
 is no longer used for reads, and `auth logout` revokes its tokens and deletes
-it with the new one. It keeps a refresh token until a token answer carries a
+it with the new one. When it cannot be read or deleted (a denied Keychain
+prompt), the patient stays in the index for another `auth logout`, the
+warning names the manual `security delete-generic-password` step, and the
+command exits with the error's code after its one document. `revoked` is
+true only when every revocation tried for the patient's items succeeded. It keeps a refresh token until a token answer carries a
 new one, and `tokens.obtained_at` is the last grant, so athena reports the
 90-day horizon as `signin_expires_at` from it. `pk_med_smart::Renewer` runs
 every renewal under the family's refresh lock (`pk_cli_auth::refresh_lock`),

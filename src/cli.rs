@@ -681,33 +681,52 @@ fn auth_logout(ctx: &Ctx, args: LogoutCmd) -> Result<(), CliError> {
     let http = BlockingTransport::new()?;
     let store = session::keychain();
     let mut out = Vec::new();
+    // The first v0.2.x item that could not be removed: its entry stays in
+    // the index, so `auth logout` again retries it, and the command ends
+    // with its code once the one document is out.
+    let mut left_behind: Option<CliError> = None;
     for entry in chosen {
         let key = entry.key();
-        let mut revoked = false;
+        // One result per item that existed: `revoked` only when all held.
+        let mut revocations = Vec::new();
         if let Ok(Some(stored)) = store.load(&key) {
-            revoked = revoke_all(&http, &stored);
+            revocations.push(revoke_all(&http, &stored));
         }
         let mut found = RefreshLock::forget_for_binary(BIN, || store.delete(&key))?;
         // A sign-in v0.2.x stored at `<org>/<patient>`: nothing else reaches
         // it, so it is revoked and removed here.
-        match session::load_legacy(&entry.org, &entry.patient) {
-            Ok(Some(legacy)) => {
-                if let Some(legacy) = &legacy {
-                    revoked |= revoke_legacy(&http, legacy);
-                }
-                found |= session::delete_legacy(&entry.org, &entry.patient)?;
+        let legacy = session::load_legacy(&entry.org, &entry.patient).and_then(|legacy| {
+            let Some(legacy) = legacy else {
+                return Ok(());
+            };
+            if let Some(legacy) = &legacy {
+                revocations.push(revoke_legacy(&http, legacy));
             }
-            Ok(None) => {}
-            Err(e) => eprintln!("warning: {}", e.message()),
+            found |= session::delete_legacy(&entry.org, &entry.patient)?;
+            Ok(())
+        });
+        let legacy_left = legacy.is_err();
+        if let Err(e) = legacy {
+            eprintln!(
+                "warning: {}; the v0.2.x sign-in of {} at {} is still in the Keychain. Run \
+                 `athena auth logout` again and allow the Keychain prompt, or remove it with \
+                 `security delete-generic-password -s {} -a <profile>/<patient>`",
+                e.message(),
+                entry.patient,
+                entry.org,
+                session::service()
+            );
+            left_behind.get_or_insert(e);
+        } else {
+            index.remove(&entry.org, &entry.patient);
+            index.save(&sessions_path)?;
         }
-        index.remove(&entry.org, &entry.patient);
-        index.save(&sessions_path)?;
         out.push(json!({
             "org": entry.org,
             "patient": entry.patient,
             "label": entry.label,
-            "credential_removed": found,
-            "revoked": revoked,
+            "credential_removed": found && !legacy_left,
+            "revoked": !revocations.is_empty() && revocations.iter().all(|ok| *ok),
         }));
     }
     if ctx.json {
@@ -725,6 +744,9 @@ fn auth_logout(ctx: &Ctx, args: LogoutCmd) -> Result<(), CliError> {
                 }
             );
         }
+    }
+    if let Some(e) = left_behind {
+        std::process::exit(e.exit_code());
     }
     Ok(())
 }
