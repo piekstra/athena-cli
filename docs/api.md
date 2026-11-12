@@ -259,7 +259,12 @@ requests and not the exceeding of a daily limit."
 
 athena sends one request at a time, retries 502 to 504 up to three times
 (1 s, 2 s, 4 s plus jitter, or the server's `Retry-After`), and retries a 429
-only when it carries a `Retry-After` of 30 s or less.
+only when it carries a `Retry-After` of 30 s or less. A search that still
+fails is an `upstream` skip, but when three requests in a row fail that way
+the export stops with `complete: false` and exit 5 (the circuit breaker), and
+a failed `Patient` read stops it at once: exit 5, or exit 3 when the read is
+refused (403), with the remedy to sign in again, since the practice may have
+turned off access for the app.
 
 ## The sandbox
 
@@ -294,6 +299,7 @@ so the old profile is exported first, and kept while the old portal is.
 | One sign-in grants one patient record | One token set per (practice profile, patient) |
 | `Appointment` search takes no `patient` parameter | Not exported |
 | `Media` has no search | Read through `DiagnosticReport.media` |
+| A 429 can mean the daily limit, where a retry only adds load | Retried only with a short `Retry-After` |
 
 [r233]: https://docs.athenahealth.com/api/resources/233-release-developer-console-allows-self-service-onboarding-all-apps-using-only
 [r227]: https://docs.athenahealth.com/api/resources/227-release-updated-enable-authentication-against-multiple-athenaone-practices

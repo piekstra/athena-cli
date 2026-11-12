@@ -20,13 +20,13 @@ name = "athena"
 path = "src/main.rs"
 
 [dependencies]
-pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0", features = ["reqwest"] }
-pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
-pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
-pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
-pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
-pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
-pk-cli-documents = { git = "https://github.com/piekstra/cli-common", tag = "v0.29.0" }
+pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.31.0", features = ["reqwest"] }
+pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.31.0" }
+pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.31.0" }
+pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.31.0" }
+pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.31.0" }
+pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.31.0" }
+pk-cli-documents = { git = "https://github.com/piekstra/cli-common", tag = "v0.31.0" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 serde = { version = "1", features = ["derive"] }

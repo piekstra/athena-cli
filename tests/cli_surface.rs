@@ -465,3 +465,42 @@ fn plain_file_export_refuses_a_real_practice_before_the_keychain() {
     );
     assert!(!out_dir.exists());
 }
+
+#[test]
+fn a_download_path_whose_directory_is_missing_or_a_file_is_refused_first() {
+    let home = tmp();
+    let missing = home.join("missing").join("x.pdf");
+    let (code, json, _) = run(
+        &home,
+        &[
+            "--json",
+            "documents",
+            "download",
+            "DocumentReference/d-1",
+            "-o",
+            missing.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 2);
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("does not exist"), "{message}");
+    assert!(!home.join("missing").exists());
+
+    let file = home.join("a-file");
+    std::fs::write(&file, b"").unwrap();
+    let under_file = file.join("x.pdf");
+    let (code, json, _) = run(
+        &home,
+        &[
+            "--json",
+            "documents",
+            "download",
+            "DocumentReference/d-1",
+            "-o",
+            under_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 2);
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("is a file, not a directory"), "{message}");
+}

@@ -74,7 +74,15 @@ pub fn export<W: Write>(
             let id = id_of(&body).unwrap_or_else(|| patient.clone());
             w.resource("Patient", &id, &body)?;
         }
-        Err(e) => skip_or_fail(w, e, Some("Patient"), Some(&patient), None)?,
+        // Without the patient there is no export. A refusal here, when the
+        // sign-in asked for Patient, means access was withdrawn.
+        Err(e) if e.reason() == Some(Reason::Forbidden) => {
+            return Err(e.with_remedy(
+                "sign in again with `athena auth login`; if it is refused again, the practice \
+                 may have turned off access for this app",
+            ))
+        }
+        Err(e) => return Err(e),
     }
 
     for resource_type in SEARCH_TYPES {
@@ -105,7 +113,14 @@ pub fn export<W: Write>(
                 reason: format!("stopped after {} pages", fhir::PAGE_CAP),
                 code: code::PAGE_CAP,
             }),
-            Err(e) => skip_or_fail(w, e, Some(resource_type), None, Some(search))?,
+            Err(e) => skip_or_fail(
+                w,
+                e,
+                Some(resource_type),
+                None,
+                Some(search),
+                client.tripped(),
+            )?,
         }
     }
 
@@ -140,7 +155,7 @@ pub fn export<W: Write>(
                     code: code::VERIFY_FAILED,
                 }),
             },
-            Err(e) => skip_or_fail(w, e, Some(resource_type), Some(id), None)?,
+            Err(e) => skip_or_fail(w, e, Some(resource_type), Some(id), None, client.tripped())?,
         }
     }
     Ok(())
@@ -215,7 +230,7 @@ fn fetch_binary<W: Write>(
                 code: code::VERIFY_FAILED,
             }),
         },
-        Err(e) => skip_or_fail(w, e, Some("Binary"), Some(&id), None)?,
+        Err(e) => skip_or_fail(w, e, Some("Binary"), Some(&id), None, client.tripped())?,
     }
     Ok(())
 }
@@ -227,11 +242,19 @@ fn skip_or_fail<W: Write>(
     resource_type: Option<&str>,
     id: Option<&str>,
     search: Option<String>,
+    tripped: bool,
 ) -> Result<(), CliError> {
     let code = match (error.base(), error.reason()) {
         (_, Some(Reason::Forbidden)) => code::FORBIDDEN,
         (CliError::NotFound(_), _) => code::NOT_FOUND,
         (_, Some(Reason::BadRequest)) => code::UNSUPPORTED,
+        (CliError::Upstream(_), _) if tripped => {
+            return Err(CliError::Upstream(format!(
+                "{} requests in a row failed, so the export stopped: {}",
+                fhir::BREAKER,
+                error.message()
+            )))
+        }
         (CliError::Upstream(_), _) => code::UPSTREAM,
         _ => return Err(error),
     };

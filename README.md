@@ -59,8 +59,8 @@ Release assets: `athena-<target>.tar.gz` and `.sha256` for
 | `config path\|show\|set\|unset` | Client ids, redirect ports, practice profiles |
 | `info`, `completions`, `self-update` | Family standard |
 
-Every command takes `--json`. Exit codes: 0 ok, 2 usage, 3 sign-in needed,
-4 not found, 5 the practice or network failed.
+Every command takes `--json`. Exit codes: 0 ok, 2 usage, 3 sign-in needed
+or refused, 4 not found, 5 the practice or network failed.
 
 `records export -o <DIR>` writes a plain file instead, for athenahealth's
 sandbox and local test servers only.

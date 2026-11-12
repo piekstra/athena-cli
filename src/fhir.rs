@@ -19,6 +19,10 @@ pub const PAGE_CAP: usize = 500;
 
 /// How often a 429, 502, 503 or 504 is retried before the request is given up.
 const RETRIES: u32 = 3;
+/// Requests in a row that may fail, each after its retries, before a pull
+/// stops: athenahealth asks clients to break the circuit rather than keep
+/// calling a server that is down.
+pub const BREAKER: u32 = 3;
 
 /// The longest a `Retry-After` is honoured.
 const MAX_WAIT: Duration = Duration::from_secs(30);
@@ -34,6 +38,8 @@ pub struct Client<'a> {
     tokens: TokenSet,
     now: fn() -> i64,
     sleep: fn(Duration),
+    /// Requests in a row that ended in a 429, a 5xx or a network error.
+    failures: u32,
 }
 
 impl<'a> Client<'a> {
@@ -54,6 +60,7 @@ impl<'a> Client<'a> {
             tokens,
             now: crate::unix_now,
             sleep: std::thread::sleep,
+            failures: 0,
         }
     }
 
@@ -107,11 +114,17 @@ impl<'a> Client<'a> {
         let mut attempt = 0;
         loop {
             let presented = self.tokens.access_token.clone();
-            let response = self.http.call(
+            let response = match self.http.call(
                 request("GET", url)
                     .header("Accept", accept)
                     .header("Authorization", format!("Bearer {presented}")),
-            )?;
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    self.failures += 1;
+                    return Err(e);
+                }
+            };
             match response.status {
                 401 if !renewed => {
                     renewed = true;
@@ -134,11 +147,43 @@ impl<'a> Client<'a> {
                         attempt += 1;
                         (self.sleep)(wait);
                     }
-                    _ => return Ok(response),
+                    _ => return Ok(self.settled(response)),
                 },
-                _ => return Ok(response),
+                _ => return Ok(self.settled(response)),
             }
         }
+    }
+
+    /// Count a final answer toward the circuit breaker: the server is up
+    /// when it answers anything but a 429 or a 5xx.
+    fn settled(&mut self, response: HttpResponse) -> HttpResponse {
+        if response.status == 429 || response.status >= 500 {
+            self.failures += 1;
+        } else {
+            self.failures = 0;
+        }
+        response
+    }
+
+    /// [`check`], with a refused token's remedy naming this sign-in's
+    /// practice profile.
+    pub fn check(&self, response: &HttpResponse, what: &str) -> Result<(), CliError> {
+        check(response, what).map_err(|e| {
+            if e.reason() == Some(Reason::CredentialRefused) {
+                let org = self.key.split('/').next().unwrap_or_default();
+                e.with_remedy(format!(
+                    "sign in again with `athena auth login --org {org}`"
+                ))
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Whether the last [`BREAKER`] requests all failed, so a pull should
+    /// stop rather than call a server that is down.
+    pub fn tripped(&self) -> bool {
+        self.failures >= BREAKER
     }
 
     /// Renew the access token under the refresh lock. `presented` is the
@@ -149,42 +194,74 @@ impl<'a> Client<'a> {
         let store = self.store;
         let key = self.key.clone();
         let now = self.now;
+        let org = key.split('/').next().unwrap_or_default().to_string();
+        let sign_in_again = format!("sign in again with `athena auth login --org {org}`");
         let read = || {
             store.get(&key)?.ok_or_else(|| {
                 CliError::Auth("this patient was signed out meanwhile".into())
                     .because(Reason::NoCredential)
-                    .with_remedy("sign in again with `athena auth login --org <ORG>`")
+                    .with_remedy(sign_in_again.clone())
             })
         };
         let due = |latest: &TokenSet| latest.access_token == presented;
+        // The sign-in as marked unusable after a refused refresh, so the
+        // caller's index follows the keychain.
+        let dead_set = std::cell::RefCell::new(None);
         let grant = |latest: TokenSet| -> Result<TokenSet, CliError> {
             let refresh_token = latest.refresh_token.clone().ok_or_else(|| {
                 CliError::Auth("the sign-in has expired and holds no refresh token".into())
                     .because(Reason::CredentialRefused)
-                    .with_remedy("sign in again with `athena auth login --org <ORG>`")
+                    .with_remedy(sign_in_again.clone())
             })?;
-            let response = oauth::refresh_grant(
+            let response = match oauth::refresh_grant(
                 http,
                 &latest.token_endpoint,
                 &latest.client_id,
                 &refresh_token,
                 &latest.scope,
-            )?;
+            ) {
+                Ok(response) => response,
+                Err(e) if e.reason() == Some(Reason::CredentialRefused) => {
+                    // The refresh token is dead: keep the item, but without
+                    // it, so `auth status` reports the sign-in as unusable.
+                    let dead = TokenSet {
+                        refresh_token: None,
+                        expires_at: now(),
+                        ..latest
+                    };
+                    let e = match store.set(&key, &dead) {
+                        Ok(()) => e,
+                        Err(write) => CliError::Auth(format!(
+                            "{}; marking the stored sign-in unusable failed too ({}), so `athena \
+                             auth status` may still call it usable",
+                            e.message(),
+                            write.message()
+                        ))
+                        .because(Reason::CredentialRefused),
+                    };
+                    *dead_set.borrow_mut() = Some(dead);
+                    return Err(e.with_remedy(sign_in_again.clone()));
+                }
+                Err(e) => return Err(e),
+            };
             let fresh = latest.renewed(response, now());
             store.set(&key, &fresh)?;
             Ok(fresh)
         };
-        self.tokens = match self.lock {
-            Some(lock) => lock.renew(read, due, grant)?,
-            None => {
-                let latest = read()?;
+        let renewed = match self.lock {
+            Some(lock) => lock.renew(read, due, grant),
+            None => read().and_then(|latest| {
                 if due(&latest) {
-                    grant(latest)?
+                    grant(latest)
                 } else {
-                    latest
+                    Ok(latest)
                 }
-            }
+            }),
         };
+        if let Some(dead) = dead_set.into_inner() {
+            self.tokens = dead;
+        }
+        self.tokens = renewed?;
         Ok(())
     }
 
@@ -192,7 +269,7 @@ impl<'a> Client<'a> {
     pub fn read(&mut self, reference: &str) -> Result<String, CliError> {
         let url = self.resolve(reference)?;
         let response = self.get(&url, FHIR_JSON)?;
-        check(&response, reference)?;
+        self.check(&response, reference)?;
         Ok(response.body)
     }
 
@@ -216,7 +293,7 @@ impl<'a> Client<'a> {
         }
         for _ in 0..PAGE_CAP {
             let response = self.get(&url, FHIR_JSON)?;
-            check(&response, resource_type)?;
+            self.check(&response, resource_type)?;
             let page: Page<'_> = serde_json::from_str(&response.body).map_err(|e| {
                 CliError::Upstream(format!(
                     "a {resource_type} search answered with something other than a Bundle: {e}"

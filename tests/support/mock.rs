@@ -366,6 +366,10 @@ impl Mock {
         }
         match s.mode.as_str() {
             "down" => return fhir_json(503, "Service Unavailable"),
+            // The patient answers; every other request fails.
+            "degraded" if !path.starts_with("Patient/") => {
+                return fhir_json(503, "Service Unavailable")
+            }
             "forbidden" => return fhir_json(403, fixture("outcome-forbidden").unwrap()),
             _ => {}
         }
