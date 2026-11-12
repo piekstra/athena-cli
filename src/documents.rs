@@ -414,9 +414,15 @@ pub fn file_name(item: &Item, content_type: Option<&str>) -> String {
     )
 }
 
+/// Whether `-o` names a directory to write into: one that exists, or a path
+/// ending in `/`.
+pub fn is_dir_target(out: &Path) -> bool {
+    out.is_dir() || out.as_os_str().to_string_lossy().ends_with('/')
+}
+
 /// Where `-o` puts a file: inside it when it is a directory, else at it.
 pub fn target(out: &Path, item: &Item, content_type: Option<&str>) -> PathBuf {
-    if out.is_dir() {
+    if is_dir_target(out) {
         out.join(file_name(item, content_type))
     } else {
         out.to_path_buf()
@@ -427,6 +433,14 @@ pub fn target(out: &Path, item: &Item, content_type: Option<&str>) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_trailing_slash_names_a_directory() {
+        assert!(is_dir_target(Path::new("docs/")));
+        assert!(is_dir_target(Path::new(".")));
+        assert!(!is_dir_target(Path::new("note.pdf")));
+        assert!(!is_dir_target(Path::new("missing-dir/note.pdf")));
+    }
 
     #[test]
     fn a_reference_with_two_files_gives_two_documents() {

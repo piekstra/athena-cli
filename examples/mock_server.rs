@@ -19,7 +19,7 @@ fn main() {
     let server = mock::Mock::start(port);
     println!("{}", server.fhir_base());
     eprintln!(
-        "mock athenahealth on {} (client id `{}`); modes: POST {}/__mock/mode?set=normal|expired|revoked|deny|down|forbidden, POST {}/__mock/expire",
+        "mock athenahealth on {} (client id `{}`); modes: POST {}/__mock/mode?set=normal|expired|revoked|deny|down|degraded|forbidden, POST {}/__mock/expire",
         server.origin(),
         mock::CLIENT_ID,
         server.origin(),

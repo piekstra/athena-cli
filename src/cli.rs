@@ -1293,10 +1293,21 @@ fn documents_cmd(ctx: &Ctx, cmd: DocumentsCmd) -> Result<(), CliError> {
             if let Some(id) = &id {
                 documents::parse_id(id)?;
             }
-            if all && !out.is_dir() {
-                create_private_dir(&out)?;
+            // A file's directory must exist; a directory `-o` names is made.
+            if !all && !documents::is_dir_target(&out) {
+                let parent = out.parent().filter(|p| !p.as_os_str().is_empty());
+                if let Some(parent) = parent.filter(|p| !p.is_dir()) {
+                    return Err(CliError::Usage(format!(
+                        "{} is not a directory",
+                        parent.display()
+                    ))
+                    .with_remedy("create it first, or end -o with / to have athena make it"));
+                }
             }
             let (entry, tokens) = open_session(ctx, &select)?;
+            if (all || documents::is_dir_target(&out)) && !out.is_dir() {
+                create_private_dir(&out)?;
+            }
             let http = BlockingTransport::new()?;
             let lock = RefreshLock::for_binary(BIN)?;
             let store = KeychainStore::new();
@@ -1410,7 +1421,7 @@ fn api(ctx: &Ctx, args: ApiCmd) -> Result<(), CliError> {
         .and_then(|url| client.get(&url, fhir::FHIR_JSON));
     note_renewal(ctx, &entry, &tokens, client.tokens());
     let response = result?;
-    fhir::check(&response, &args.path)?;
+    client.check(&response, &args.path)?;
     match serde_json::from_str::<Value>(&response.body) {
         Ok(value) => output::json(&value),
         Err(_) => println!("{}", response.body),

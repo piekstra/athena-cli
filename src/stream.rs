@@ -113,6 +113,7 @@ struct Trailer<'a> {
 struct TrailerError<'a> {
     code: &'a str,
     message: &'a str,
+    exit_code: i32,
 }
 
 /// Writes one stream: the header once, resources deduplicated by
@@ -225,6 +226,7 @@ impl<W: Write> Writer<W> {
             error: error.zip(message.as_deref()).map(|(e, m)| TrailerError {
                 code: e.code(),
                 message: m,
+                exit_code: e.exit_code(),
             }),
         };
         let line = serde_json::to_string(&trailer)
@@ -357,5 +359,6 @@ mod tests {
         let tail: serde_json::Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
         assert_eq!(tail["complete"], false);
         assert_eq!(tail["error"]["code"], err.code());
+        assert_eq!(tail["error"]["exit_code"], err.exit_code());
     }
 }

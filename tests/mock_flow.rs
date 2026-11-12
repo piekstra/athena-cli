@@ -250,14 +250,22 @@ fn a_revoked_sign_in_ends_the_stream_incomplete_with_exit_3() {
     w.header(&header(&tokens)).unwrap();
     let err = export::export(&mut c, &mut w, None).unwrap_err();
     assert_eq!(err.exit_code(), 3);
+    assert!(
+        err.to_string().contains("athena auth login --org mock"),
+        "{err}"
+    );
     let out = lines(w.fail(&err, String::new()).unwrap());
     let trailer = out.last().unwrap();
     assert_eq!(trailer["complete"], false);
     assert_eq!(trailer["error"]["code"], err.code());
+    // The dead refresh token is dropped, so status reports the sign-in unusable.
+    let stored = store.get(&key("mock", mock::PATIENT)).unwrap().unwrap();
+    assert!(stored.refresh_token.is_none());
+    assert!(!stored.usable(athena::unix_now()));
 }
 
 #[test]
-fn a_server_that_is_down_is_retried_then_skipped() {
+fn a_server_that_is_down_fails_the_export_after_retries() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
@@ -267,23 +275,65 @@ fn a_server_that_is_down_is_retried_then_skipped() {
     let before = m.requests().len();
     let mut w = Writer::new(Vec::new());
     w.header(&header(&tokens)).unwrap();
-    export::export(&mut c, &mut w, None).expect("503s become skips");
-    let out = lines(w.finish(String::new()).unwrap());
+    let err = export::export(&mut c, &mut w, None).expect_err("no patient, no export");
+    assert_eq!(err.exit_code(), 5);
+    let out = lines(w.fail(&err, String::new()).unwrap());
+    assert_eq!(out.len(), 2, "header and trailer only");
+    assert_eq!(out[1]["complete"], false);
+    assert_eq!(out[1]["error"]["exit_code"], 5);
+    // Patient: one request and three retries, and nothing after it.
+    let after = &m.requests()[before..];
+    assert_eq!(after.len(), 4);
+    assert!(after
+        .iter()
+        .all(|(_, p)| p.ends_with(&format!("Patient/{}", mock::PATIENT))));
+}
+
+#[test]
+fn a_refused_patient_read_ends_the_export_as_a_sign_in_problem() {
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let tokens = sign_in(&m, &http);
+    let store = MemoryStore::default();
+    let mut c = client(&http, &store, &tokens);
+    m.set_mode("forbidden");
+    let mut w = Writer::new(Vec::new());
+    w.header(&header(&tokens)).unwrap();
+    let err = export::export(&mut c, &mut w, None).expect_err("refused");
+    assert_eq!(err.exit_code(), 3);
+    assert!(err.to_string().contains("turned off access"), "{err}");
+    let out = lines(w.fail(&err, String::new()).unwrap());
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[1]["complete"], false);
+}
+
+#[test]
+fn failing_searches_trip_the_breaker() {
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let tokens = sign_in(&m, &http);
+    let store = MemoryStore::default();
+    let mut c = client(&http, &store, &tokens);
+    m.set_mode("degraded");
+    let before = m.requests().len();
+    let mut w = Writer::new(Vec::new());
+    w.header(&header(&tokens)).unwrap();
+    let err = export::export(&mut c, &mut w, None).expect_err("the breaker trips");
+    assert_eq!(err.exit_code(), 5);
+    assert!(err.to_string().contains("in a row"), "{err}");
+    let out = lines(w.fail(&err, String::new()).unwrap());
     let trailer = out.last().unwrap();
-    assert_eq!(trailer["complete"], true);
-    assert!(trailer["skipped"]
+    assert_eq!(trailer["complete"], false);
+    assert_eq!(trailer["counts"]["Patient"], 1);
+    let upstream = trailer["skipped"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|s| s["code"] == "upstream"
-            || s["code"] == "forbidden"
-            || s["code"] == "unsupported"));
-    // Patient: one request and three retries.
-    let patient_reads = m.requests()[before..]
-        .iter()
-        .filter(|(_, p)| p.ends_with(&format!("Patient/{}", mock::PATIENT)))
+        .filter(|s| s["code"] == "upstream")
         .count();
-    assert_eq!(patient_reads, 4);
+    assert_eq!(upstream as u32, athena::fhir::BREAKER - 1);
+    // The patient read, then three searches of four attempts each.
+    assert_eq!(m.requests().len() - before, 1 + 3 * 4);
 }
 
 #[test]
