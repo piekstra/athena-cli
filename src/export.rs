@@ -2,7 +2,9 @@
 //! `records-stream/v1` stream.
 
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use pk_cli_core::{CliError, Reason};
 use serde_json::value::RawValue;
@@ -11,7 +13,10 @@ use serde_json::Value;
 use crate::fhir::{self, Client, SearchEnd};
 use crate::http::same_origin;
 use crate::smart::{granted_types, PATIENT_TYPES};
-use crate::stream::{code, Skip, Writer};
+use pk_med_fhir::RawResource;
+use pk_med_records::dto::RecordsExport;
+
+use crate::stream::{code, Finished, Header, Skip, Writer};
 
 /// Searched by `patient`, in this order. `Patient` is read first; `Binary`
 /// follows the resource that points at it.
@@ -47,6 +52,47 @@ pub const REFERENCED_TYPES: &[&str] = &[
     "Media",
 ];
 
+/// One stream into `out`, header to trailer: `pull` writes the resources and
+/// skips. The second value is the error that cut the pull short, which the
+/// trailer records as `complete: false`. `Err` means not even the header,
+/// or the trailer, could be written.
+pub fn write_stream<W: Write>(
+    out: W,
+    header: &Header,
+    finished_at: impl FnOnce() -> String,
+    pull: impl FnOnce(&mut Writer<W>) -> Result<(), CliError>,
+) -> Result<(Finished, Option<CliError>), CliError> {
+    let mut w = Writer::start(out, header)?;
+    let error = pull(&mut w).err();
+    let finished = w.finish(finished_at(), error.as_ref())?;
+    Ok((finished, error))
+}
+
+/// `records export -o <DIR>`: the stream to `<DIR>/records.ndjson`
+/// (`pk_med_records::export::create_export_file`: owner-only, replacing the
+/// file of an earlier run) and its `records-export/v1` summary. A pull cut
+/// short still leaves its stream, marked `complete: false`, and returns its
+/// error beside the summary. A stream whose header or trailer could not be
+/// written is removed.
+pub fn write_dir(
+    dir: &Path,
+    header: &Header,
+    finished_at: impl FnOnce() -> String,
+    pull: impl FnOnce(&mut Writer<BufWriter<File>>) -> Result<(), CliError>,
+) -> Result<(RecordsExport, Option<CliError>), CliError> {
+    let (path, file) = pk_med_records::export::create_export_file(dir)?;
+    match write_stream(BufWriter::new(file), header, finished_at, pull) {
+        Ok((finished, error)) => Ok((
+            RecordsExport::new(path.display().to_string(), &finished),
+            error,
+        )),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
+
 /// Export the client's patient to `w`, whose header is already written.
 /// Returns an error only for what ends the stream (a refused sign-in, a
 /// failed write); everything else becomes a skip.
@@ -71,29 +117,33 @@ pub fn export<W: Write>(
     let reference = format!("Patient/{patient}");
     match client.read(&reference) {
         Ok(body) => {
-            let id = id_of(&body).unwrap_or_else(|| patient.clone());
-            w.resource("Patient", &id, &body)?;
+            w.resource(&RawResource::parse(&body)?)?;
         }
         // Without the patient there is no export. A refusal here, when the
         // sign-in asked for Patient, means access was withdrawn.
         Err(e) if e.reason() == Some(Reason::Forbidden) => {
-            return Err(e.with_remedy(
-                "sign in again with `athena auth login`; if it is refused again, the practice \
-                 may have turned off access for this app",
-            ))
+            return Err(e.with_remedy(format!(
+                "sign in again with `athena auth login --org {}`; if it is refused again, the \
+                 practice may have turned off access for this app",
+                client.org()
+            )))
         }
         Err(e) => return Err(e),
     }
 
     for resource_type in SEARCH_TYPES {
-        let search = format!("{resource_type}?patient={patient}");
+        // As records-stream/v1 asks: the search without the patient's id.
+        let search = match since {
+            Some(since) => format!("{resource_type}?_lastUpdated=ge{since}"),
+            None => resource_type.to_string(),
+        };
         if !granted.contains(*resource_type) {
             w.skip(Skip {
                 resource_type: Some(resource_type.to_string()),
                 id: None,
                 search: Some(search),
                 reason: "the sign-in did not grant this resource type".into(),
-                code: code::FORBIDDEN,
+                code: code::FORBIDDEN.into(),
             });
             continue;
         }
@@ -111,7 +161,7 @@ pub fn export<W: Write>(
                 id: None,
                 search: Some(search),
                 reason: format!("stopped after {} pages", fhir::PAGE_CAP),
-                code: code::PAGE_CAP,
+                code: code::PAGE_CAP.into(),
             }),
             Err(e) => skip_or_fail(
                 w,
@@ -128,7 +178,7 @@ pub fn export<W: Write>(
         let Some((resource_type, id)) = reference.split_once('/') else {
             continue;
         };
-        if w.has(resource_type, id) {
+        if w.written(resource_type, id) {
             continue;
         }
         if !granted.contains(resource_type) {
@@ -137,7 +187,7 @@ pub fn export<W: Write>(
                 id: Some(id.into()),
                 search: None,
                 reason: "the sign-in did not grant this resource type".into(),
-                code: code::FORBIDDEN,
+                code: code::FORBIDDEN.into(),
             });
             continue;
         }
@@ -152,7 +202,7 @@ pub fn export<W: Write>(
                     id: Some(id.into()),
                     search: None,
                     reason: "the server answered with something other than JSON".into(),
-                    code: code::VERIFY_FAILED,
+                    code: code::VERIFY_FAILED.into(),
                 }),
             },
             Err(e) => skip_or_fail(w, e, Some(resource_type), Some(id), None, client.tripped())?,
@@ -170,10 +220,23 @@ fn write_resource<W: Write>(
     references: &mut BTreeSet<String>,
     binary_granted: bool,
 ) -> Result<(), CliError> {
-    let Some((resource_type, id)) = fhir::identity(raw) else {
-        return Ok(());
+    let resource = match RawResource::parse(raw.get()) {
+        Ok(resource) => resource,
+        Err(e) => {
+            w.skip(Skip {
+                resource_type: None,
+                id: None,
+                search: None,
+                reason: format!(
+                    "a search answered with an entry that did not read: {}",
+                    e.message()
+                ),
+                code: code::VERIFY_FAILED.into(),
+            });
+            return Ok(());
+        }
     };
-    if !w.resource(&resource_type, &id, raw.get())? {
+    if !w.resource(&resource)? {
         return Ok(());
     }
     let Ok(value) = serde_json::from_str::<Value>(raw.get()) else {
@@ -200,11 +263,11 @@ fn fetch_binary<W: Write>(
             reason: "an attachment points somewhere other than this FHIR server's Binary; athena \
                      sends its token nowhere else"
                 .into(),
-            code: code::UNSUPPORTED,
+            code: code::UNSUPPORTED.into(),
         });
         return Ok(());
     };
-    if w.has("Binary", &id) {
+    if w.written("Binary", &id) {
         return Ok(());
     }
     if !granted {
@@ -213,21 +276,21 @@ fn fetch_binary<W: Write>(
             id: Some(id),
             search: None,
             reason: "the sign-in did not grant Binary".into(),
-            code: code::FORBIDDEN,
+            code: code::FORBIDDEN.into(),
         });
         return Ok(());
     }
     match client.read(url) {
-        Ok(body) => match fhir_identity(&body) {
-            Some((t, _)) if t == "Binary" => {
-                w.resource("Binary", &id, &body)?;
+        Ok(body) => match RawResource::parse(&body) {
+            Ok(binary) if binary.resource_type == "Binary" => {
+                w.resource(&binary)?;
             }
             _ => w.skip(Skip {
                 resource_type: Some("Binary".into()),
                 id: Some(id),
                 search: None,
                 reason: "the server answered with something other than a Binary resource".into(),
-                code: code::VERIFY_FAILED,
+                code: code::VERIFY_FAILED.into(),
             }),
         },
         Err(e) => skip_or_fail(w, e, Some("Binary"), Some(&id), None, client.tripped())?,
@@ -263,18 +326,9 @@ fn skip_or_fail<W: Write>(
         id: id.map(Into::into),
         search,
         reason: error.message().to_string(),
-        code,
+        code: code.into(),
     });
     Ok(())
-}
-
-fn id_of(body: &str) -> Option<String> {
-    fhir_identity(body).map(|(_, id)| id)
-}
-
-fn fhir_identity(body: &str) -> Option<(String, String)> {
-    let raw: &RawValue = serde_json::from_str(body).ok()?;
-    fhir::identity(raw)
 }
 
 /// `Binary/<id>` from an attachment URL, relative or on the FHIR server's

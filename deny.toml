@@ -27,4 +27,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # The family's shared crates (pk-cli-*) are consumed as tag-pinned git deps
 # until they land on crates.io.
-allow-git = ["https://github.com/piekstra/cli-common"]
+allow-git = [
+    "https://github.com/piekstra/cli-common",
+    "https://github.com/piekstra/medical-common",
+]

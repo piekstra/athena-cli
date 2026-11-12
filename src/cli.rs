@@ -1,6 +1,6 @@
 //! The command line: the clap tree and one handler per command.
 
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use crate::fhir::{self, Client};
 use crate::login;
 use crate::oauth;
 use crate::session::{self, KeychainStore, SessionEntry, SessionIndex, TokenSet, TokenStore};
-use crate::stream::{self, Header, Writer};
+use crate::stream::{self, Header};
 use crate::{unix_now, BIN, REPO, VERSION};
 
 /// Unofficial; not affiliated with or endorsed by athenahealth. A patient's or
@@ -206,6 +206,10 @@ pub enum OrgsCmd {
     #[command(visible_alias = "ls")]
     List,
     /// Search the cached directory of athenahealth practices by name, city, state, ZIP or id.
+    ///
+    /// Each match's `id` is the directory's `<practice>-<brand>-<csg>` key,
+    /// not a profile `--org` can name: save one with `config set practice
+    /// <SLUG> --practice-id <P> --brand-id <B> --csg-id <C>`.
     Search {
         /// Words that must all appear in the name, city, state, ZIP or ids
         #[arg(value_name = "TEXT", required = true)]
@@ -248,8 +252,9 @@ pub struct ExportCmd {
     /// Write the stream to stdout, for `medrec import --from athena`.
     #[arg(long, conflicts_with = "out")]
     pub ndjson: bool,
-    /// Write the stream to a new plain file in this directory: the sandbox
-    /// and test servers only.
+    /// Write the stream to DIR/records.ndjson and print records-export/v1:
+    /// the sandbox and test servers only. Each run replaces the file, a
+    /// failed one with its partial stream (complete: false).
     #[arg(short = 'o', long = "out", value_name = "DIR")]
     pub out: Option<PathBuf>,
 }
@@ -864,7 +869,7 @@ fn orgs(ctx: &Ctx, cmd: OrgsCmd) -> Result<(), CliError> {
                     let mut row = Map::new();
                     row.insert("id".into(), json!(org.slug));
                     row.insert("name".into(), json!(p.display_name(&org.slug)));
-                    row.insert("vendor".into(), json!("athenahealth"));
+                    row.insert("vendor".into(), json!(stream::VENDOR));
                     row.insert("environment".into(), json!(p.environment));
                     for (k, v) in [
                         ("practice_id", &p.practice_id),
@@ -913,11 +918,11 @@ fn orgs(ctx: &Ctx, cmd: OrgsCmd) -> Result<(), CliError> {
             })?;
             let found = dir.search(&query);
             let total = found.len();
-            let items: Vec<Value> = found
+            let items = found
                 .into_iter()
                 .take(limit)
-                .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
-                .collect();
+                .map(directory_item)
+                .collect::<Result<Vec<Value>, CliError>>()?;
             if ctx.json {
                 let mut page = Paged::new("org", items);
                 page.total = Some(total as u64);
@@ -958,6 +963,49 @@ fn orgs(ctx: &Ctx, cmd: OrgsCmd) -> Result<(), CliError> {
     }
 }
 
+/// A directory entry as an `org-list/v1` item: health-records/v1's
+/// `Organization` fields (`id`, `name`, `fhir_base`, `vendor`, `location`),
+/// then the ids `config set practice` takes. Its `id` is the directory's key,
+/// `<practice>-<brand>-<csg>`, not a practice profile: `--org` takes the slug
+/// a profile is saved under.
+fn directory_item(e: &directory::Entry) -> Result<Value, CliError> {
+    let mut row = Map::new();
+    let ids: Vec<&str> = [&e.practice_id, &e.brand_id, &e.csg_id]
+        .into_iter()
+        .filter_map(|v| v.as_deref())
+        .collect();
+    let id = if ids.is_empty() {
+        pk_cli_documents::fs_safe(&e.name.to_lowercase())
+    } else {
+        ids.join("-")
+    };
+    row.insert("id".into(), json!(id));
+    // Without a brand endpoint the practice is reached through athenahealth's
+    // global base, as a profile with no ids is.
+    let base = e
+        .fhir_base
+        .clone()
+        .unwrap_or_else(|| format!("{}/fhir/r4", crate::env::PRODUCTION_API));
+    row.insert("fhir_base".into(), json!(base));
+    row.insert("vendor".into(), json!(stream::VENDOR));
+    let location = match (&e.city, &e.state) {
+        (Some(city), Some(state)) => Some(format!("{city}, {state}")),
+        (Some(one), None) | (None, Some(one)) => Some(one.clone()),
+        (None, None) => None,
+    };
+    if let Some(location) = location {
+        row.insert("location".into(), json!(location));
+    }
+    let fields = serde_json::to_value(e)
+        .map_err(|err| CliError::Other(format!("encoding a directory entry: {err}")))?;
+    if let Value::Object(fields) = fields {
+        for (k, v) in fields {
+            row.entry(k).or_insert(v);
+        }
+    }
+    Ok(Value::Object(row))
+}
+
 fn patients_list(ctx: &Ctx, org: Option<&str>) -> Result<(), CliError> {
     if let Some(org) = org {
         config::validate_slug(org)?;
@@ -976,7 +1024,8 @@ fn patients_list(ctx: &Ctx, org: Option<&str>) -> Result<(), CliError> {
             if let Some(rel) = &e.relationship {
                 row.insert("relationship".into(), json!(rel));
             }
-            row.insert("kind".into(), json!("patient"));
+            row.insert("kind".into(), json!(stream::kind::PATIENT));
+            row.insert("session".into(), json!(e.key()));
             row.insert("environment".into(), json!(e.environment));
             row.insert("stored_at".into(), json!(e.stored_at));
             if let Some(at) = &e.signin_expires_at {
@@ -1081,77 +1130,83 @@ fn stream_header(ctx: &Ctx, entry: &SessionEntry, since: Option<&str>) -> Result
                 entry.org.clone()
             }
         });
-    Ok(Header::new(
+    Ok(stream::header(
         stream::Organization {
             id: entry.org.clone(),
             name,
             fhir_base: entry.fhir_base.clone(),
-            vendor: "athenahealth",
+            vendor: Some(stream::VENDOR.into()),
+            location: None,
+            aliases: Vec::new(),
         },
-        stream::Patient {
+        stream::PatientContext {
             id: entry.patient.clone(),
             organization: entry.org.clone(),
             label: entry.label.clone(),
             relationship: entry.relationship.clone(),
-            kind: "patient",
+            kind: Some(stream::kind::PATIENT.into()),
+            member_role: None,
+            fhir_user: None,
+            name: None,
+            session: None,
         },
         since.map(str::to_string),
         dates::fmt_rfc3339(unix_now()),
     ))
 }
 
-/// How one export ended.
-enum ExportEnd<W: Write> {
-    /// Before the header: nothing was written.
-    Before(CliError),
-    /// After the header, with every search done.
-    Done(Writer<W>),
-    /// After the header, cut short.
-    Failed(Writer<W>, CliError),
+/// What an export needs before its first byte: a failure here writes
+/// nothing anywhere.
+struct Prepared {
+    entry: SessionEntry,
+    tokens: TokenSet,
+    header: Header,
+    http: BlockingTransport,
+    lock: RefreshLock,
 }
 
-/// Run one export into `out`, header to the last resource; the caller
-/// writes the trailer.
-fn run_export<W: Write>(ctx: &Ctx, args: &ExportCmd, out: W) -> ExportEnd<W> {
-    let prepared = (|| {
-        let (entry, tokens) = open_session(ctx, &args.select)?;
-        let header = stream_header(ctx, &entry, args.since.as_deref())?;
-        let http = BlockingTransport::new()?;
-        let lock = RefreshLock::for_binary(BIN)?;
-        Ok::<_, CliError>((entry, tokens, header, http, lock))
-    })();
-    let (entry, tokens, header, http, lock) = match prepared {
-        Ok(p) => p,
-        Err(e) => return ExportEnd::Before(e),
-    };
+fn prepare_export(ctx: &Ctx, args: &ExportCmd) -> Result<Prepared, CliError> {
+    let (entry, tokens) = open_session(ctx, &args.select)?;
+    let header = stream_header(ctx, &entry, args.since.as_deref())?;
+    Ok(Prepared {
+        entry,
+        tokens,
+        header,
+        http: BlockingTransport::new()?,
+        lock: RefreshLock::for_binary(BIN)?,
+    })
+}
+
+/// Run `f` with a read client over the prepared sign-in, then record a
+/// renewal it made in the session index, whatever `f` returned.
+fn with_client<T>(ctx: &Ctx, p: &Prepared, f: impl FnOnce(&mut Client<'_>) -> T) -> T {
     let store = KeychainStore::new();
-    let mut client = Client::new(&http, &store, Some(&lock), entry.key(), tokens.clone());
-    let mut w = Writer::new(out);
-    if let Err(e) = w.header(&header) {
-        return ExportEnd::Before(e);
-    }
-    let result = export::export(&mut client, &mut w, args.since.as_deref());
-    note_renewal(ctx, &entry, &tokens, client.tokens());
-    match result {
-        Ok(()) => ExportEnd::Done(w),
-        Err(e) => ExportEnd::Failed(w, e),
-    }
+    let mut client = Client::new(
+        &p.http,
+        &store,
+        Some(&p.lock),
+        p.entry.key(),
+        p.tokens.clone(),
+    );
+    let out = f(&mut client);
+    note_renewal(ctx, &p.entry, &p.tokens, client.tokens());
+    out
+}
+
+fn now_rfc3339() -> String {
+    dates::fmt_rfc3339(unix_now())
 }
 
 fn export_to_stdout(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
+    let p = prepare_export(ctx, args)?;
+    let since = args.since.as_deref();
     let stdout = std::io::stdout();
-    let out = BufWriter::new(stdout.lock());
-    match run_export(ctx, args, out) {
-        ExportEnd::Done(w) => {
-            w.finish(dates::fmt_rfc3339(unix_now()))?;
-            Ok(())
-        }
-        ExportEnd::Failed(w, e) => {
-            w.fail(&e, dates::fmt_rfc3339(unix_now()))?;
-            Err(e)
-        }
-        ExportEnd::Before(e) => Err(e),
-    }
+    let (_, error) = with_client(ctx, &p, |client| {
+        export::write_stream(BufWriter::new(stdout.lock()), &p.header, now_rfc3339, |w| {
+            export::export(client, w, since)
+        })
+    })?;
+    error.map_or(Ok(()), Err)
 }
 
 fn export_to_dir(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
@@ -1170,50 +1225,37 @@ fn export_to_dir(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
              which runs `{BIN} records export --patient {who} --ndjson`"
         )));
     }
-    create_private_dir(&dir)?;
-    let stamp = dates::fmt_rfc3339(unix_now()).replace([':', '-'], "");
-    let who = entry.label.clone().unwrap_or_else(|| entry.patient.clone());
-    let path = dir.join(format!(
-        "{}_{}_{}.ndjson",
-        pk_cli_documents::fs_safe(&entry.org),
-        pk_cli_documents::fs_safe(&who),
-        pk_cli_documents::fs_safe(&stamp)
-    ));
-    let file = create_private_file(&path)?;
-    let finished = match run_export(ctx, args, BufWriter::new(file)) {
-        ExportEnd::Done(w) => {
-            let counts = w.counts().clone();
-            let skipped = w.skipped().len();
-            w.finish(dates::fmt_rfc3339(unix_now()))?;
-            (counts, skipped)
-        }
-        ExportEnd::Failed(w, e) => {
-            w.fail(&e, dates::fmt_rfc3339(unix_now()))?;
-            eprintln!("the stream in {} ends with complete: false", path.display());
-            return Err(e);
-        }
-        ExportEnd::Before(e) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
-        }
-    };
-    let (counts, skipped) = finished;
-    let total: u64 = counts.values().sum();
-    let value = json!({
-        "path": path.display().to_string(),
-        "complete": true,
-        "resources": total,
-        "counts": counts,
-        "skipped": skipped,
-    });
-    output::emit(ctx.json, "records-export", value, |v| {
+    let p = prepare_export(ctx, args)?;
+    let since = args.since.as_deref();
+    let (export, error) = with_client(ctx, &p, |client| {
+        export::write_dir(&dir, &p.header, now_rfc3339, |w| {
+            export::export(client, w, since)
+        })
+    })?;
+    // One records-export/v1 document, complete or not (medical-common
+    // DESIGN 1.5); a pull cut short then exits with its error's code.
+    if ctx.json {
+        let value = serde_json::to_value(&export)
+            .map_err(|e| CliError::Other(format!("encoding records-export/v1: {e}")))?;
+        output::json(&value);
+    } else {
+        let total: u64 = export.counts.values().sum();
         println!(
-            "Wrote {} resources ({} skipped) to {}.",
-            v["resources"],
-            v["skipped"],
-            v["path"].as_str().unwrap_or_default()
+            "Wrote {total} resources ({} skipped, {} bytes) to {}{}.",
+            export.skipped.len(),
+            export.bytes,
+            export.path,
+            if export.complete {
+                ""
+            } else {
+                ", ending with complete: false"
+            }
         );
-    });
+    }
+    if let Some(e) = error {
+        eprintln!("error: {e}");
+        std::process::exit(e.exit_code());
+    }
     Ok(())
 }
 
@@ -1249,19 +1291,6 @@ fn create_private_dir(dir: &Path) -> Result<(), CliError> {
     builder
         .create(dir)
         .map_err(|e| CliError::Other(format!("creating {}: {e}", dir.display())))
-}
-
-fn create_private_file(path: &Path) -> Result<std::fs::File, CliError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|e| CliError::Other(format!("creating {}: {e}", path.display())))
 }
 
 /// Write bytes to a new file, or replace a file athena wrote before, owner-only.

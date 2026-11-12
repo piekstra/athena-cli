@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "athena-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "base64 0.22.1",
@@ -226,6 +226,8 @@ dependencies = [
  "pk-cli-http",
  "pk-cli-secrets",
  "pk-cli-selfupdate",
+ "pk-med-fhir",
+ "pk-med-records",
  "predicates",
  "reqwest",
  "serde",
@@ -1519,6 +1521,29 @@ dependencies = [
  "self-replace",
  "serde_json",
  "tar",
+]
+
+[[package]]
+name = "pk-med-fhir"
+version = "0.1.0"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.1.0#7e1a66bdf26e869b46001a752393266c88c63fe9"
+dependencies = [
+ "base64 0.22.1",
+ "pk-cli-core",
+ "pk-cli-secrets",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pk-med-records"
+version = "0.1.0"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.1.0#7e1a66bdf26e869b46001a752393266c88c63fe9"
+dependencies = [
+ "pk-cli-core",
+ "pk-med-fhir",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

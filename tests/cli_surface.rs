@@ -504,3 +504,56 @@ fn a_download_path_whose_directory_is_missing_or_a_file_is_refused_first() {
     let message = json["error"]["message"].as_str().unwrap();
     assert!(message.contains("is a file, not a directory"), "{message}");
 }
+
+#[test]
+fn org_and_patient_items_read_as_the_profiles_dtos() {
+    use pk_med_records::dto::{Organization, PatientContext};
+    let home = tmp();
+    let state = home.join("athena");
+    std::fs::create_dir_all(&state).unwrap();
+    let bundle = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/directory/bundle.json"
+    ))
+    .unwrap();
+    athena::directory::parse(bundle.as_slice(), "test", "2026-01-01T00:00:00Z".into())
+        .unwrap()
+        .save(&state.join("directory.json"))
+        .unwrap();
+    std::fs::write(
+        state.join("sessions.json"),
+        serde_json::json!({"sessions": [{
+            "org": "clinic",
+            "patient": "a-900001.E-1001",
+            "label": "kid",
+            "relationship": "proxy",
+            "environment": "production",
+            "fhir_base": "https://api.platform.athenahealth.com/900001/brand/1/csg/1/fhir/r4",
+            "stored_at": "2026-01-01T00:00:00Z"
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+
+    for args in [
+        &["--json", "orgs", "search", "pediatrics"][..],
+        &["--json", "orgs", "list"][..],
+    ] {
+        let (code, v, err) = run(&home, args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert_eq!(v["schema"], "org-list/v1");
+        for item in v["items"].as_array().unwrap() {
+            let org: Organization = serde_json::from_value(item.clone())
+                .unwrap_or_else(|e| panic!("{args:?}: {e}: {item}"));
+            assert_eq!(org.vendor.as_deref(), Some("athenahealth"));
+        }
+    }
+
+    let (code, v, err) = run(&home, &["--json", "patients", "list"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(v["schema"], "patient-list/v1");
+    let patient: PatientContext = serde_json::from_value(v["items"][0].clone()).unwrap();
+    assert_eq!(patient.organization, "clinic");
+    assert_eq!(patient.kind.as_deref(), Some("patient"));
+    assert_eq!(patient.session.as_deref(), Some("clinic/a-900001.E-1001"));
+}

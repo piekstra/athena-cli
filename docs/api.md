@@ -266,6 +266,16 @@ a failed `Patient` read stops it at once: exit 5, or exit 3 when the read is
 refused (403), with the remedy to sign in again, since the practice may have
 turned off access for the app.
 
+An answer that is not a 2xx maps to an exit code by medical-common's
+`pk_med_fhir::outcome::status_error`. The `OperationOutcome`'s issue code is
+used when the contract knows it: `login`, `unknown` or `expired` is exit 3
+(sign in again), `forbidden`, `suppressed` or `security` exit 3 (refused),
+`not-found` or `deleted` exit 4. Otherwise the HTTP status decides: 401 and
+403 exit 3, 404 and 410 exit 4, any other 4xx exit 5 (an `unsupported`
+skip), and 5xx exit 5. A 429, a 5xx, or a 403 whose body is an HTML page
+(athenahealth's edge rather than the FHIR server) is exit 5 with no reason,
+so it counts toward the circuit breaker instead of reading as a refusal.
+
 ## The sandbox
 
 From the [Onboarding Overview][onboarding]: "We have also configured a dummy
