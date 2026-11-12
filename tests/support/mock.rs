@@ -47,6 +47,7 @@ fn fixture(path: &str) -> Option<&'static str> {
         "Patient" => fixture!("patient.json"),
         "AllergyIntolerance" => fixture!("search-AllergyIntolerance.json"),
         "Condition" => fixture!("search-Condition.json"),
+        "Condition-malformed" => fixture!("search-Condition-malformed.json"),
         "Encounter" => fixture!("search-Encounter.json"),
         "Observation" => fixture!("search-Observation.json"),
         "Observation-page2" => fixture!("search-Observation-page2.json"),
@@ -382,6 +383,7 @@ impl Mock {
                 return r;
             }
         }
+        let malformed = s.mode == "malformed";
         drop(s);
         let serve = |text: &str| fhir_json(200, &text.replace("{{BASE}}", &base));
         if !id.is_empty() {
@@ -407,6 +409,8 @@ impl Mock {
         }
         match resource_type {
             "Goal" => fhir_json(403, fixture("outcome-forbidden").unwrap()),
+            // An entry with no resourceType, then a good one.
+            "Condition" if malformed => serve(fixture("Condition-malformed").unwrap()),
             "ServiceRequest" => fhir_json(400, fixture("outcome-unsupported").unwrap()),
             "Observation" if q.get("cursor").map(String::as_str) == Some("2") => serve(fixture("Observation-page2").unwrap()),
             t => match fixture(t) {

@@ -1,6 +1,6 @@
 //! The command line: the clap tree and one handler per command.
 
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,9 +25,8 @@ use crate::fhir::{self, Client};
 use crate::login;
 use crate::oauth;
 use crate::session::{self, KeychainStore, SessionEntry, SessionIndex, TokenSet, TokenStore};
-use crate::stream::{self, Finished, Header, Writer};
+use crate::stream::{self, Header};
 use crate::{unix_now, BIN, REPO, VERSION};
-use pk_med_records::dto::RecordsExport;
 
 /// Unofficial; not affiliated with or endorsed by athenahealth. A patient's or
 /// caregiver's own records from athenahealth practices, through athenahealth's
@@ -207,6 +206,10 @@ pub enum OrgsCmd {
     #[command(visible_alias = "ls")]
     List,
     /// Search the cached directory of athenahealth practices by name, city, state, ZIP or id.
+    ///
+    /// Each match's `id` is the directory's `<practice>-<brand>-<csg>` key,
+    /// not a profile `--org` can name: save one with `config set practice
+    /// <SLUG> --practice-id <P> --brand-id <B> --csg-id <C>`.
     Search {
         /// Words that must all appear in the name, city, state, ZIP or ids
         #[arg(value_name = "TEXT", required = true)]
@@ -249,8 +252,9 @@ pub struct ExportCmd {
     /// Write the stream to stdout, for `medrec import --from athena`.
     #[arg(long, conflicts_with = "out")]
     pub ndjson: bool,
-    /// Write the stream to DIR/records.ndjson, replacing it, and print
-    /// records-export/v1: the sandbox and test servers only.
+    /// Write the stream to DIR/records.ndjson and print records-export/v1:
+    /// the sandbox and test servers only. Each run replaces the file, a
+    /// failed one with its partial stream (complete: false).
     #[arg(short = 'o', long = "out", value_name = "DIR")]
     pub out: Option<PathBuf>,
 }
@@ -914,7 +918,11 @@ fn orgs(ctx: &Ctx, cmd: OrgsCmd) -> Result<(), CliError> {
             })?;
             let found = dir.search(&query);
             let total = found.len();
-            let items: Vec<Value> = found.into_iter().take(limit).map(directory_item).collect();
+            let items = found
+                .into_iter()
+                .take(limit)
+                .map(directory_item)
+                .collect::<Result<Vec<Value>, CliError>>()?;
             if ctx.json {
                 let mut page = Paged::new("org", items);
                 page.total = Some(total as u64);
@@ -957,8 +965,10 @@ fn orgs(ctx: &Ctx, cmd: OrgsCmd) -> Result<(), CliError> {
 
 /// A directory entry as an `org-list/v1` item: health-records/v1's
 /// `Organization` fields (`id`, `name`, `fhir_base`, `vendor`, `location`),
-/// then the ids `config set practice` takes.
-fn directory_item(e: &directory::Entry) -> Value {
+/// then the ids `config set practice` takes. Its `id` is the directory's key,
+/// `<practice>-<brand>-<csg>`, not a practice profile: `--org` takes the slug
+/// a profile is saved under.
+fn directory_item(e: &directory::Entry) -> Result<Value, CliError> {
     let mut row = Map::new();
     let ids: Vec<&str> = [&e.practice_id, &e.brand_id, &e.csg_id]
         .into_iter()
@@ -986,12 +996,14 @@ fn directory_item(e: &directory::Entry) -> Value {
     if let Some(location) = location {
         row.insert("location".into(), json!(location));
     }
-    if let Value::Object(fields) = serde_json::to_value(e).unwrap_or(Value::Null) {
+    let fields = serde_json::to_value(e)
+        .map_err(|err| CliError::Other(format!("encoding a directory entry: {err}")))?;
+    if let Value::Object(fields) = fields {
         for (k, v) in fields {
             row.entry(k).or_insert(v);
         }
     }
-    Value::Object(row)
+    Ok(Value::Object(row))
 }
 
 fn patients_list(ctx: &Ctx, org: Option<&str>) -> Result<(), CliError> {
@@ -1165,15 +1177,9 @@ fn prepare_export(ctx: &Ctx, args: &ExportCmd) -> Result<Prepared, CliError> {
     })
 }
 
-/// Write one export into `out`, header to trailer. The second value is the
-/// error that cut it short, which the trailer records as `complete: false`;
-/// `Err` means not even the header could be written.
-fn run_export<W: Write>(
-    ctx: &Ctx,
-    args: &ExportCmd,
-    p: &Prepared,
-    out: W,
-) -> Result<(Finished, Option<CliError>), CliError> {
+/// Run `f` with a read client over the prepared sign-in, then record a
+/// renewal it made in the session index, whatever `f` returned.
+fn with_client<T>(ctx: &Ctx, p: &Prepared, f: impl FnOnce(&mut Client<'_>) -> T) -> T {
     let store = KeychainStore::new();
     let mut client = Client::new(
         &p.http,
@@ -1182,21 +1188,25 @@ fn run_export<W: Write>(
         p.entry.key(),
         p.tokens.clone(),
     );
-    let mut w = Writer::start(out, &p.header)?;
-    let result = export::export(&mut client, &mut w, args.since.as_deref());
+    let out = f(&mut client);
     note_renewal(ctx, &p.entry, &p.tokens, client.tokens());
-    let error = result.err();
-    let finished = w.finish(dates::fmt_rfc3339(unix_now()), error.as_ref())?;
-    Ok((finished, error))
+    out
+}
+
+fn now_rfc3339() -> String {
+    dates::fmt_rfc3339(unix_now())
 }
 
 fn export_to_stdout(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
-    let prepared = prepare_export(ctx, args)?;
+    let p = prepare_export(ctx, args)?;
+    let since = args.since.as_deref();
     let stdout = std::io::stdout();
-    match run_export(ctx, args, &prepared, BufWriter::new(stdout.lock()))? {
-        (_, None) => Ok(()),
-        (_, Some(e)) => Err(e),
-    }
+    let (_, error) = with_client(ctx, &p, |client| {
+        export::write_stream(BufWriter::new(stdout.lock()), &p.header, now_rfc3339, |w| {
+            export::export(client, w, since)
+        })
+    })?;
+    error.map_or(Ok(()), Err)
 }
 
 fn export_to_dir(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
@@ -1215,24 +1225,36 @@ fn export_to_dir(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
              which runs `{BIN} records export --patient {who} --ndjson`"
         )));
     }
-    let prepared = prepare_export(ctx, args)?;
-    let (path, file) = pk_med_records::export::create_export_file(&dir)?;
-    let (finished, error) = run_export(ctx, args, &prepared, BufWriter::new(file))?;
-    if let Some(e) = error {
-        eprintln!("the stream in {} ends with complete: false", path.display());
-        return Err(e);
-    }
-    let export = RecordsExport::new(path.display().to_string(), &finished);
+    let p = prepare_export(ctx, args)?;
+    let since = args.since.as_deref();
+    let (export, error) = with_client(ctx, &p, |client| {
+        export::write_dir(&dir, &p.header, now_rfc3339, |w| {
+            export::export(client, w, since)
+        })
+    })?;
+    // One records-export/v1 document, complete or not (medical-common
+    // DESIGN 1.5); a pull cut short then exits with its error's code.
     if ctx.json {
-        output::json(&serde_json::to_value(&export).unwrap_or(Value::Null));
+        let value = serde_json::to_value(&export)
+            .map_err(|e| CliError::Other(format!("encoding records-export/v1: {e}")))?;
+        output::json(&value);
     } else {
+        let total: u64 = export.counts.values().sum();
         println!(
-            "Wrote {} resources ({} skipped, {} bytes) to {}.",
-            finished.trailer.total(),
+            "Wrote {total} resources ({} skipped, {} bytes) to {}{}.",
             export.skipped.len(),
             export.bytes,
-            export.path
+            export.path,
+            if export.complete {
+                ""
+            } else {
+                ", ending with complete: false"
+            }
         );
+    }
+    if let Some(e) = error {
+        eprintln!("error: {e}");
+        std::process::exit(e.exit_code());
     }
     Ok(())
 }

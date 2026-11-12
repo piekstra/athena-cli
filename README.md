@@ -48,7 +48,7 @@ Release assets: `athena-<target>.tar.gz` and `.sha256` for
 
 | Command | What it does |
 |---|---|
-| `orgs refresh\|list\|search` | Practice profiles (`org-list/v1`), and athenahealth's directory of practices, downloaded on `refresh` (about 135 MB) and kept as names, places and ids |
+| `orgs refresh\|list\|search` | Practice profiles (`org-list/v1`), and athenahealth's directory of practices, downloaded on `refresh` (about 135 MB) and kept as names, places and ids. A search match's `id` is the directory's `<practice>-<brand>-<csg>` key; `--org` takes a profile's slug |
 | `config set\|unset practice <slug>` | A practice profile: environment, practice, brand and chart sharing group ids, or a FHIR base in full |
 | `auth login --org <ORG> [--label <WHO>]` | Standalone patient launch in the browser (PKCE, loopback); one sign-in per patient record |
 | `auth status` / `auth logout` | Each sign-in's state (`auth-status/v1`); remove one or all |
@@ -62,9 +62,12 @@ Release assets: `athena-<target>.tar.gz` and `.sha256` for
 Every command takes `--json`. Exit codes: 0 ok, 2 usage, 3 sign-in needed
 or refused, 4 not found, 5 the practice or network failed.
 
-`records export -o <DIR>` writes `<DIR>/records.ndjson` instead (owner-only,
-replaced on each run) and prints `records-export/v1`, for athenahealth's
-sandbox and local test servers only.
+`records export -o <DIR>` writes `<DIR>/records.ndjson` instead and prints
+`records-export/v1`, for athenahealth's sandbox and local test servers only.
+The file is owner-only and replaced on each run, a failed run included: a
+pull cut short leaves its partial stream there, marked `complete: false`,
+and exits with its error's code. Up to v0.1.0, `-o` wrote a new
+`<profile>_<patient>_<time>.ndjson` on each run.
 
 ## How sign-in works
 

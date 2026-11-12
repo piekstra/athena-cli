@@ -14,7 +14,7 @@ use athena::export;
 use athena::fhir::Client;
 use athena::login;
 use athena::session::{key, MemoryStore, TokenSet, TokenStore};
-use athena::stream::{self, Writer};
+use athena::stream;
 use pk_cli_core::{CliError, RangeArgs};
 use pk_cli_http::BlockingTransport;
 use serde_json::Value;
@@ -99,12 +99,32 @@ fn header(tokens: &TokenSet) -> stream::Header {
 /// the stream's text, and the error that cut it short (recorded in the
 /// trailer as `complete: false`).
 fn pull(c: &mut Client<'_>, tokens: &TokenSet) -> (String, Result<(), CliError>) {
+    pull_since(c, tokens, None)
+}
+
+fn pull_since(
+    c: &mut Client<'_>,
+    tokens: &TokenSet,
+    since: Option<&str>,
+) -> (String, Result<(), CliError>) {
     let mut buf = Vec::new();
-    let mut w = Writer::start(&mut buf, &header(tokens)).unwrap();
-    let result = export::export(c, &mut w, None);
-    w.finish("2026-01-01T00:00:01Z", result.as_ref().err())
-        .unwrap();
-    (String::from_utf8(buf).unwrap(), result)
+    let mut header = header(tokens);
+    header.since = since.map(str::to_string);
+    let (_, error) = export::write_stream(
+        &mut buf,
+        &header,
+        || "2026-01-01T00:00:01Z".into(),
+        |w| export::export(c, w, since),
+    )
+    .unwrap();
+    (String::from_utf8(buf).unwrap(), error.map_or(Ok(()), Err))
+}
+
+/// A new, empty directory for one test.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("athena-mock-flow-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 fn lines(text: &str) -> Vec<Value> {
@@ -217,7 +237,6 @@ fn numbers_reach_the_stream_as_the_server_wrote_them() {
     let mut c = client(&http, &store, &tokens);
     let (text, result) = pull(&mut c, &tokens);
     result.unwrap();
-    let text = text.clone();
     let weight = text
         .lines()
         .find(|l| l.contains("\"id\":\"ob-1\""))
@@ -467,4 +486,126 @@ fn the_stream_reads_back_with_the_consumers_reader() {
     for search in searches {
         assert!(!search.contains(&tokens.patient), "{search}");
     }
+}
+
+#[test]
+fn a_since_pull_names_the_bound_in_skipped_searches() {
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let tokens = sign_in(&m, &http);
+    let store = MemoryStore::default();
+    let mut c = client(&http, &store, &tokens);
+    let (text, result) = pull_since(&mut c, &tokens, Some("2026-01-01"));
+    result.expect("export");
+    let out = lines(&text);
+    assert_eq!(out[0]["since"], "2026-01-01");
+    let searches: Vec<&str> = out.last().unwrap()["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["search"].as_str())
+        .collect();
+    assert!(
+        searches.contains(&"ServiceRequest?_lastUpdated=ge2026-01-01"),
+        "{searches:?}"
+    );
+    assert!(searches.iter().all(|s| !s.contains(&tokens.patient)));
+}
+
+#[test]
+fn a_search_entry_that_does_not_read_is_a_skip_and_the_rest_is_kept() {
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let tokens = sign_in(&m, &http);
+    let store = MemoryStore::default();
+    let mut c = client(&http, &store, &tokens);
+    m.set_mode("malformed");
+    let (text, result) = pull(&mut c, &tokens);
+    result.expect("export");
+    let out = lines(&text);
+    let trailer = out.last().unwrap();
+    assert_eq!(trailer["complete"], true);
+    let bad: Vec<&Value> = trailer["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["code"] == "verify_failed")
+        .collect();
+    assert_eq!(bad.len(), 1, "{trailer}");
+    assert!(bad[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no resourceType"));
+    assert!(out
+        .iter()
+        .any(|l| l["resourceType"] == "Condition" && l["id"] == "co-9"));
+    assert_eq!(trailer["counts"]["Condition"], 1);
+}
+
+#[test]
+fn an_export_to_a_directory_replaces_records_ndjson_and_reports_records_export() {
+    use pk_med_records::stream::{Item, RecordsReader, StreamError};
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let tokens = sign_in(&m, &http);
+    let store = MemoryStore::default();
+    let mut c = client(&http, &store, &tokens);
+    let dir = scratch("out");
+    let now = || "2026-01-01T00:00:01Z".to_string();
+
+    let mut sizes = Vec::new();
+    for _ in 0..2 {
+        let (export, error) = export::write_dir(&dir, &header(&tokens), now, |w| {
+            export::export(&mut c, w, None)
+        })
+        .unwrap();
+        assert!(error.is_none());
+        let v = serde_json::to_value(&export).unwrap();
+        assert_eq!(v["schema"], "records-export/v1");
+        assert_eq!(v["complete"], true);
+        assert!(export.path.ends_with("/records.ndjson"), "{}", export.path);
+        let meta = std::fs::metadata(&export.path).unwrap();
+        assert_eq!(meta.len(), export.bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+        let file = std::fs::File::open(&export.path).unwrap();
+        let mut reader = RecordsReader::new(std::io::BufReader::new(file));
+        reader.header().unwrap();
+        let mut read = 0u64;
+        for item in reader {
+            if let Item::Resource(_) = item.unwrap() {
+                read += 1;
+            }
+        }
+        assert_eq!(read, export.counts.values().sum::<u64>());
+        sizes.push(export.bytes);
+    }
+    assert_eq!(sizes[0], sizes[1]);
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["records.ndjson".to_string()]);
+
+    // A pull cut short replaces the file with its partial stream, and says so.
+    m.set_mode("degraded");
+    let (export, error) = export::write_dir(&dir, &header(&tokens), now, |w| {
+        export::export(&mut c, w, None)
+    })
+    .unwrap();
+    assert_eq!(error.expect("cut short").exit_code(), 5);
+    assert!(!export.complete);
+    assert!(export.bytes < sizes[0]);
+    let file = std::fs::File::open(&export.path).unwrap();
+    let mut reader = RecordsReader::new(std::io::BufReader::new(file));
+    reader.header().unwrap();
+    let last = reader.last().expect("an item");
+    assert!(
+        matches!(last, Err(StreamError::Incomplete { .. })),
+        "{last:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

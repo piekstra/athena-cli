@@ -1,0 +1,41 @@
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "total": 2,
+  "link": [
+    {
+      "relation": "self",
+      "url": "{{BASE}}/search"
+    }
+  ],
+  "entry": [
+    {
+      "fullUrl": "{{BASE}}/Condition/co-8",
+      "resource": {
+        "id": "co-8",
+        "code": {
+          "text": "Synthetic condition with no resourceType"
+        }
+      },
+      "search": {
+        "mode": "match"
+      }
+    },
+    {
+      "fullUrl": "{{BASE}}/Condition/co-9",
+      "resource": {
+        "resourceType": "Condition",
+        "id": "co-9",
+        "subject": {
+          "reference": "Patient/a-900001.E-1001"
+        },
+        "code": {
+          "text": "Synthetic condition after the malformed one"
+        }
+      },
+      "search": {
+        "mode": "match"
+      }
+    }
+  ]
+}

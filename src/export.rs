@@ -2,7 +2,9 @@
 //! `records-stream/v1` stream.
 
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use pk_cli_core::{CliError, Reason};
 use serde_json::value::RawValue;
@@ -12,8 +14,9 @@ use crate::fhir::{self, Client, SearchEnd};
 use crate::http::same_origin;
 use crate::smart::{granted_types, PATIENT_TYPES};
 use pk_med_fhir::RawResource;
+use pk_med_records::dto::RecordsExport;
 
-use crate::stream::{code, Skip, Writer};
+use crate::stream::{code, Finished, Header, Skip, Writer};
 
 /// Searched by `patient`, in this order. `Patient` is read first; `Binary`
 /// follows the resource that points at it.
@@ -48,6 +51,47 @@ pub const REFERENCED_TYPES: &[&str] = &[
     "Medication",
     "Media",
 ];
+
+/// One stream into `out`, header to trailer: `pull` writes the resources and
+/// skips. The second value is the error that cut the pull short, which the
+/// trailer records as `complete: false`. `Err` means not even the header,
+/// or the trailer, could be written.
+pub fn write_stream<W: Write>(
+    out: W,
+    header: &Header,
+    finished_at: impl FnOnce() -> String,
+    pull: impl FnOnce(&mut Writer<W>) -> Result<(), CliError>,
+) -> Result<(Finished, Option<CliError>), CliError> {
+    let mut w = Writer::start(out, header)?;
+    let error = pull(&mut w).err();
+    let finished = w.finish(finished_at(), error.as_ref())?;
+    Ok((finished, error))
+}
+
+/// `records export -o <DIR>`: the stream to `<DIR>/records.ndjson`
+/// (`pk_med_records::export::create_export_file`: owner-only, replacing the
+/// file of an earlier run) and its `records-export/v1` summary. A pull cut
+/// short still leaves its stream, marked `complete: false`, and returns its
+/// error beside the summary. A stream whose header or trailer could not be
+/// written is removed.
+pub fn write_dir(
+    dir: &Path,
+    header: &Header,
+    finished_at: impl FnOnce() -> String,
+    pull: impl FnOnce(&mut Writer<BufWriter<File>>) -> Result<(), CliError>,
+) -> Result<(RecordsExport, Option<CliError>), CliError> {
+    let (path, file) = pk_med_records::export::create_export_file(dir)?;
+    match write_stream(BufWriter::new(file), header, finished_at, pull) {
+        Ok((finished, error)) => Ok((
+            RecordsExport::new(path.display().to_string(), &finished),
+            error,
+        )),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
 
 /// Export the client's patient to `w`, whose header is already written.
 /// Returns an error only for what ends the stream (a refused sign-in, a
