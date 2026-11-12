@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "athena-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "assert_cmd",
  "base64 0.22.1",
@@ -1439,8 +1439,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-auth"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "getrandom 0.4.3",
@@ -1454,8 +1454,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-config"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "pk-cli-core",
  "serde",
@@ -1464,8 +1464,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-core"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "libc",
@@ -1476,8 +1476,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-documents"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "pk-cli-core",
  "serde",
@@ -1486,8 +1486,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-http"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "pk-cli-core",
@@ -1497,8 +1497,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-secrets"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "keyring",
@@ -1511,8 +1511,8 @@ dependencies = [
 
 [[package]]
 name = "pk-cli-selfupdate"
-version = "0.31.0"
-source = "git+https://github.com/piekstra/cli-common?tag=v0.31.0#bf3a3e534428b931f13c4f426eec270bd9a38fd8"
+version = "0.31.1"
+source = "git+https://github.com/piekstra/cli-common?tag=v0.31.1#a8ad14976febd0782d9830388d95b86e8713028a"
 dependencies = [
  "clap",
  "flate2",
@@ -1525,8 +1525,8 @@ dependencies = [
 
 [[package]]
 name = "pk-med-fhir"
-version = "0.1.0"
-source = "git+https://github.com/piekstra/medical-common?tag=v0.1.0#7e1a66bdf26e869b46001a752393266c88c63fe9"
+version = "0.2.0"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.2.0#10713394efd0aa1823df81c136bf6368770c9f7c"
 dependencies = [
  "base64 0.22.1",
  "pk-cli-core",
@@ -1537,8 +1537,8 @@ dependencies = [
 
 [[package]]
 name = "pk-med-records"
-version = "0.1.0"
-source = "git+https://github.com/piekstra/medical-common?tag=v0.1.0#7e1a66bdf26e869b46001a752393266c88c63fe9"
+version = "0.2.0"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.2.0#10713394efd0aa1823df81c136bf6368770c9f7c"
 dependencies = [
  "pk-cli-core",
  "pk-med-fhir",

@@ -253,8 +253,8 @@ pub struct ExportCmd {
     #[arg(long, conflicts_with = "out")]
     pub ndjson: bool,
     /// Write the stream to DIR/records.ndjson and print records-export/v1:
-    /// the sandbox and test servers only. Each run replaces the file, a
-    /// failed one with its partial stream (complete: false).
+    /// the sandbox and test servers only. A run cut short writes
+    /// DIR/records.incomplete.ndjson and keeps the last complete export.
     #[arg(short = 'o', long = "out", value_name = "DIR")]
     pub out: Option<PathBuf>,
 }
