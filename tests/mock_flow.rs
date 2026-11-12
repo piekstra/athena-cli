@@ -262,6 +262,9 @@ fn a_revoked_sign_in_ends_the_stream_incomplete_with_exit_3() {
     let stored = store.get(&key("mock", mock::PATIENT)).unwrap().unwrap();
     assert!(stored.refresh_token.is_none());
     assert!(!stored.usable(athena::unix_now()));
+    // The client holds the same marked set, which is what the caller writes
+    // into the session index.
+    assert_eq!(c.tokens(), &stored);
 }
 
 #[test]

@@ -204,6 +204,9 @@ impl<'a> Client<'a> {
             })
         };
         let due = |latest: &TokenSet| latest.access_token == presented;
+        // The sign-in as marked unusable after a refused refresh, so the
+        // caller's index follows the keychain.
+        let dead_set = std::cell::RefCell::new(None);
         let grant = |latest: TokenSet| -> Result<TokenSet, CliError> {
             let refresh_token = latest.refresh_token.clone().ok_or_else(|| {
                 CliError::Auth("the sign-in has expired and holds no refresh token".into())
@@ -223,10 +226,20 @@ impl<'a> Client<'a> {
                     // it, so `auth status` reports the sign-in as unusable.
                     let dead = TokenSet {
                         refresh_token: None,
-                        expires_at: 0,
+                        expires_at: now(),
                         ..latest
                     };
-                    let _ = store.set(&key, &dead);
+                    let e = match store.set(&key, &dead) {
+                        Ok(()) => e,
+                        Err(write) => CliError::Auth(format!(
+                            "{}; marking the stored sign-in unusable failed too ({}), so `athena \
+                             auth status` may still call it usable",
+                            e.message(),
+                            write.message()
+                        ))
+                        .because(Reason::CredentialRefused),
+                    };
+                    *dead_set.borrow_mut() = Some(dead);
                     return Err(e.with_remedy(sign_in_again.clone()));
                 }
                 Err(e) => return Err(e),
@@ -235,17 +248,20 @@ impl<'a> Client<'a> {
             store.set(&key, &fresh)?;
             Ok(fresh)
         };
-        self.tokens = match self.lock {
-            Some(lock) => lock.renew(read, due, grant)?,
-            None => {
-                let latest = read()?;
+        let renewed = match self.lock {
+            Some(lock) => lock.renew(read, due, grant),
+            None => read().and_then(|latest| {
                 if due(&latest) {
-                    grant(latest)?
+                    grant(latest)
                 } else {
-                    latest
+                    Ok(latest)
                 }
-            }
+            }),
         };
+        if let Some(dead) = dead_set.into_inner() {
+            self.tokens = dead;
+        }
+        self.tokens = renewed?;
         Ok(())
     }
 

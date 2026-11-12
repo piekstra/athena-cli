@@ -277,7 +277,8 @@ pub enum DocumentsCmd {
         /// Every document, into the directory -o names.
         #[arg(long)]
         all: bool,
-        /// Where to write: a file, or a directory to write into.
+        /// Where to write: a file (its directory must exist), or a directory to
+        /// write into; end it with / to have athena create the directory.
         #[arg(short = 'o', long = "out", value_name = "PATH")]
         out: PathBuf,
         #[command(flatten)]
@@ -1029,7 +1030,9 @@ fn open_session(ctx: &Ctx, select: &Select) -> Result<(SessionEntry, TokenSet), 
 
 /// Keep the index's expiry in step after a command renewed the token.
 fn note_renewal(ctx: &Ctx, entry: &SessionEntry, before: &TokenSet, after: &TokenSet) {
-    if before.refreshed_at == after.refreshed_at {
+    if before.refreshed_at == after.refreshed_at
+        && before.signin_expires_at() == after.signin_expires_at()
+    {
         return;
     }
     let Ok(path) = ctx.sessions_path() else {
@@ -1297,11 +1300,15 @@ fn documents_cmd(ctx: &Ctx, cmd: DocumentsCmd) -> Result<(), CliError> {
             if !all && !documents::is_dir_target(&out) {
                 let parent = out.parent().filter(|p| !p.as_os_str().is_empty());
                 if let Some(parent) = parent.filter(|p| !p.is_dir()) {
-                    return Err(CliError::Usage(format!(
-                        "{} is not a directory",
-                        parent.display()
-                    ))
-                    .with_remedy("create it first, or end -o with / to have athena make it"));
+                    return Err(if parent.exists() {
+                        CliError::Usage(format!("{} is a file, not a directory", parent.display()))
+                            .with_remedy("choose another path for -o")
+                    } else {
+                        CliError::Usage(format!("{} does not exist", parent.display())).with_remedy(
+                            "create it first, or end -o with / to have athena create it as a \
+                             directory",
+                        )
+                    });
                 }
             }
             let (entry, tokens) = open_session(ctx, &select)?;
@@ -1432,6 +1439,60 @@ fn api(ctx: &Ctx, args: ApiCmd) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_refresh_moves_the_index_horizon_with_the_keychain() {
+        use crate::env::Environment;
+        let dir = std::env::temp_dir().join(format!("athena-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = Ctx {
+            json: true,
+            quiet: true,
+            store: ConfigStore::new(BIN).with_override(Some(dir.join("config.json"))),
+        };
+        let now = unix_now();
+        let before = TokenSet {
+            access_token: "access-1".into(),
+            refresh_token: Some("refresh-1".into()),
+            expires_at: now + 3600,
+            scope: "openid".into(),
+            patient: "a-900001.E-1001".into(),
+            client_id: "client".into(),
+            fhir_base: "http://127.0.0.1:9/fhir/r4".into(),
+            token_endpoint: "http://127.0.0.1:9/token".into(),
+            revocation_endpoint: None,
+            issuer: None,
+            fhir_user: None,
+            refreshed_at: now,
+        };
+        let entry = SessionEntry {
+            org: "mock".into(),
+            patient: before.patient.clone(),
+            label: None,
+            relationship: None,
+            environment: Environment::Custom,
+            fhir_base: before.fhir_base.clone(),
+            stored_at: dates::fmt_rfc3339(now),
+            signin_expires_at: Some(dates::fmt_rfc3339(before.signin_expires_at())),
+        };
+        let mut index = SessionIndex::default();
+        index.upsert(entry.clone());
+        index.save(&ctx.sessions_path().unwrap()).unwrap();
+        // What `Client::renew` keeps after an invalid_grant: same refresh
+        // time, no refresh token, access expired now.
+        let dead = TokenSet {
+            refresh_token: None,
+            expires_at: now,
+            ..before.clone()
+        };
+        note_renewal(&ctx, &entry, &before, &dead);
+        let saved = SessionIndex::load(&ctx.sessions_path().unwrap()).unwrap();
+        assert_eq!(
+            saved.sessions[0].signin_expires_at.as_deref(),
+            Some(dates::fmt_rfc3339(now).as_str())
+        );
+        assert!(!dead.usable(now));
+    }
 
     #[test]
     fn only_synthetic_servers_may_be_written_to_a_plain_file() {

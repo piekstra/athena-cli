@@ -262,7 +262,9 @@ athena sends one request at a time, retries 502 to 504 up to three times
 only when it carries a `Retry-After` of 30 s or less. A search that still
 fails is an `upstream` skip, but when three requests in a row fail that way
 the export stops with `complete: false` and exit 5 (the circuit breaker), and
-a failed `Patient` read stops it at once.
+a failed `Patient` read stops it at once: exit 5, or exit 3 when the read is
+refused (403), with the remedy to sign in again, since the practice may have
+turned off access for the app.
 
 ## The sandbox
 
