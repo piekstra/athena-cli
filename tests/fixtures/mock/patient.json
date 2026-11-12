@@ -1,0 +1,24 @@
+{
+  "resourceType": "Patient",
+  "id": "a-900001.E-1001",
+  "meta": {
+    "lastUpdated": "2026-01-02T00:00:00Z"
+  },
+  "identifier": [
+    {
+      "system": "urn:example:mrn",
+      "value": "TEST-0001"
+    }
+  ],
+  "name": [
+    {
+      "use": "official",
+      "family": "Testpatient",
+      "given": [
+        "Sample"
+      ]
+    }
+  ],
+  "gender": "unknown",
+  "birthDate": "2025-01-01"
+}

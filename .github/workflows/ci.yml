@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Every push and PR runs on ubuntu only. The test suite never touches a
+# keychain (AGENTS.md), so a macOS runner would exercise nothing more; the
+# darwin builds run in the tag-only release workflow, and `make verify` runs
+# locally on macOS before each push.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  ATHENA_KEYCHAIN_SERVICE: piekstra.athena.hermetic-tests
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The keyring crate's Linux backend (libdbus-sys) needs the system
+      # D-Bus library and pkg-config to build.
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      - name: smoke
+        run: make smoke
+
+  security:
+    runs-on: ubuntu-latest
+    # gitleaks-action reads the PR's commits through the API, which the
+    # read-only token refuses on pull_request events.
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # cargo-audit and cargo-deny read Cargo.lock without compiling the tree.
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: cargo-deny
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

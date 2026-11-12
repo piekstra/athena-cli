@@ -1,0 +1,39 @@
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "total": 1,
+  "link": [
+    {
+      "relation": "self",
+      "url": "{{BASE}}/search"
+    }
+  ],
+  "entry": [
+    {
+      "fullUrl": "{{BASE}}/Condition/co-1",
+      "resource": {
+        "resourceType": "Condition",
+        "id": "co-1",
+        "subject": {
+          "reference": "Patient/a-900001.E-1001"
+        },
+        "code": {
+          "text": "Synthetic condition"
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                "code": "problem-list-item"
+              }
+            ]
+          }
+        ]
+      },
+      "search": {
+        "mode": "match"
+      }
+    }
+  ]
+}

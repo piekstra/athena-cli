@@ -1,0 +1,88 @@
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "total": 2,
+  "link": [
+    {
+      "relation": "self",
+      "url": "{{BASE}}/search"
+    }
+  ],
+  "entry": [
+    {
+      "fullUrl": "{{BASE}}/DocumentReference/doc-1",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "doc-1",
+        "status": "current",
+        "subject": {
+          "reference": "Patient/a-900001.E-1001"
+        },
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "34117-2",
+              "display": "History and physical note"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note"
+              }
+            ]
+          }
+        ],
+        "date": "2026-02-02T10:00:00Z",
+        "description": "Synthetic visit summary",
+        "content": [
+          {
+            "attachment": {
+              "contentType": "application/pdf",
+              "url": "Binary/bin-pdf-1"
+            }
+          }
+        ]
+      },
+      "search": {
+        "mode": "match"
+      }
+    },
+    {
+      "fullUrl": "{{BASE}}/DocumentReference/doc-2",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "doc-2",
+        "status": "current",
+        "subject": {
+          "reference": "Patient/a-900001.E-1001"
+        },
+        "type": {
+          "text": "Synthetic letter"
+        },
+        "date": "2026-01-20T10:00:00Z",
+        "content": [
+          {
+            "attachment": {
+              "contentType": "application/pdf",
+              "url": "Binary/bin-pdf-2"
+            }
+          },
+          {
+            "attachment": {
+              "contentType": "application/pdf",
+              "url": "https://elsewhere.example/Binary/x-1"
+            }
+          }
+        ]
+      },
+      "search": {
+        "mode": "match"
+      }
+    }
+  ]
+}

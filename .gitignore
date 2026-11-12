@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+
+# Never commit real responses: they carry tokens, patient identifiers and
+# medical records. Fixtures under tests/fixtures/ are invented by hand.
+/captures
+*.har
+*.raw.json
+*.ndjson

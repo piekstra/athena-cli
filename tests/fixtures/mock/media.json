@@ -1,0 +1,12 @@
+{
+  "resourceType": "Media",
+  "id": "media-1",
+  "status": "completed",
+  "subject": {
+    "reference": "Patient/a-900001.E-1001"
+  },
+  "content": {
+    "contentType": "image/png",
+    "url": "Binary/bin-png-2"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "resourceType": "OperationOutcome",
+  "issue": [
+    {
+      "severity": "error",
+      "code": "not-supported",
+      "diagnostics": "Synthetic: search parameter not supported"
+    }
+  ]
+}

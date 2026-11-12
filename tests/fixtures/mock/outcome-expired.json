@@ -1,0 +1,10 @@
+{
+  "resourceType": "OperationOutcome",
+  "issue": [
+    {
+      "severity": "error",
+      "code": "login",
+      "diagnostics": "Synthetic: token expired"
+    }
+  ]
+}

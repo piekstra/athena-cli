@@ -1,0 +1,37 @@
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "total": 1,
+  "link": [
+    {
+      "relation": "self",
+      "url": "{{BASE}}/search"
+    }
+  ],
+  "entry": [
+    {
+      "fullUrl": "{{BASE}}/AllergyIntolerance/al-1",
+      "resource": {
+        "resourceType": "AllergyIntolerance",
+        "id": "al-1",
+        "patient": {
+          "reference": "Patient/a-900001.E-1001"
+        },
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+              "code": "active"
+            }
+          ]
+        },
+        "code": {
+          "text": "Synthetic allergen"
+        }
+      },
+      "search": {
+        "mode": "match"
+      }
+    }
+  ]
+}
