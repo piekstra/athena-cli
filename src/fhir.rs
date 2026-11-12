@@ -1,461 +1,324 @@
-//! The FHIR read client: a bearer token kept fresh, reads, searches that
-//! follow `Bundle.link[next]`, and HTTP statuses mapped onto exit codes.
+//! The FHIR read client: medical-common's `pk_med_fhir::FhirClient` with
+//! athenahealth's retry guidance, a bearer kept fresh by
+//! `pk_med_smart::Renewer`, and the circuit breaker a pull counts.
 
+use std::cell::Cell;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use pk_cli_auth::oauth::{ClientAuth, OAuthClient};
 use pk_cli_auth::refresh_lock::RefreshLock;
-use pk_cli_core::transport::HttpResponse;
-use pk_cli_core::{CliError, Reason};
-use serde::Deserialize;
-use serde_json::value::RawValue;
+use pk_cli_auth::token::DEFAULT_SKEW_SECS;
+use pk_cli_core::{block_on, CliError, Reason};
+use pk_cli_http::BlockingTransport;
+use pk_cli_secrets::Secret;
+use pk_med_fhir::outcome::TRY_AGAIN;
+use pk_med_fhir::{
+    FhirClient, RawResource, RetryPolicy, SearchEnd, SearchPage, SearchResult, UNREACHABLE,
+};
+use pk_med_smart::{Renewer, SmartSession};
 
-use crate::http::{request, same_origin, Http};
-use crate::oauth;
-use crate::session::{TokenSet, TokenStore};
+use crate::session::{self, Store};
+use crate::smart::Athenahealth;
+use crate::{BIN, VERSION};
 
 /// Searches stop after this many pages; the stream records a `page_cap` skip.
-pub const PAGE_CAP: usize = 500;
+pub const PAGE_CAP: u32 = 500;
 
-/// How often a 429, 502, 503 or 504 is retried before the request is given up.
-const RETRIES: u32 = 3;
 /// Requests in a row that may fail, each after its retries, before a pull
 /// stops: athenahealth asks clients to break the circuit rather than keep
 /// calling a server that is down.
 pub const BREAKER: u32 = 3;
 
-/// The longest a `Retry-After` is honoured.
-const MAX_WAIT: Duration = Duration::from_secs(30);
-
-pub const FHIR_JSON: &str = "application/fhir+json";
-
-/// A signed-in patient's session against one FHIR server.
-pub struct Client<'a> {
-    http: &'a dyn Http,
-    store: &'a dyn TokenStore,
-    lock: Option<&'a RefreshLock>,
-    key: String,
-    tokens: TokenSet,
-    now: fn() -> i64,
-    sleep: fn(Duration),
-    /// Requests in a row that ended in a 429, a 5xx or a network error.
-    failures: u32,
+/// athenahealth's [Timeouts, Retries, and Backoff] guidance (`docs/api.md`):
+/// four requests in all, 1 s, 2 s and 4 s apart, each wait lengthened by up
+/// to a quarter; a 502, 503 or 504 asked again, and a 429 only when it says
+/// when (`Retry-After`) within 30 s, since one that does not may be a daily
+/// limit.
+pub fn retry_policy() -> RetryPolicy {
+    RetryPolicy::default()
+        .attempts(4)
+        .delay(Duration::from_secs(1))
+        .max_wait(Duration::from_secs(30))
+        .server_errors(&[502, 503, 504])
+        .retry_after_required(true)
+        .jitter(0.25)
 }
 
-impl<'a> Client<'a> {
-    /// A client over a stored session. `lock` is the cross-process refresh
-    /// lock; tests pass `None`.
-    pub fn new(
-        http: &'a dyn Http,
-        store: &'a dyn TokenStore,
-        lock: Option<&'a RefreshLock>,
-        key: String,
-        tokens: TokenSet,
-    ) -> Client<'a> {
-        Client {
-            http,
+fn now() -> u64 {
+    crate::unix_now().max(0) as u64
+}
+
+/// The remedy of a refused or missing sign-in names this practice profile.
+pub fn remedied(org: &str, error: CliError) -> CliError {
+    match error.reason() {
+        Some(Reason::CredentialRefused | Reason::NoCredential) => {
+            error.with_remedy(session::sign_in_again(org))
+        }
+        _ => error,
+    }
+}
+
+/// A sign-in in use: its session renewed when its token has lapsed or was
+/// refused, and renewed again when athenahealth refuses its token mid-run.
+/// It owns what renewal needs, so the FHIR client can call it from its
+/// `bearer_with` source.
+#[derive(Clone)]
+pub struct Live {
+    account: String,
+    store: Store,
+    lock: RefreshLock,
+    oauth: OAuthClient<BlockingTransport>,
+    /// The client the tokens were issued to, which renews them.
+    client_id: String,
+    current: Arc<Mutex<SmartSession>>,
+}
+
+impl Live {
+    /// The session as read from `store`, renewed first when it is due. The
+    /// renewal reads the store again under the refresh lock, so a token
+    /// another process renewed meanwhile is used rather than spent again.
+    pub fn start(
+        store: Store,
+        lock: RefreshLock,
+        transport: BlockingTransport,
+        session: SmartSession,
+    ) -> Result<Live, CliError> {
+        let live = Live {
+            account: session.account(),
+            client_id: session.client_id.clone(),
+            oauth: OAuthClient::new(transport, BIN, VERSION),
             store,
             lock,
-            key,
-            tokens,
-            now: crate::unix_now,
-            sleep: std::thread::sleep,
-            failures: 0,
-        }
+            current: Arc::new(Mutex::new(session)),
+        };
+        live.bearer(None)?;
+        Ok(live)
     }
 
-    /// Replace the clock and the sleep, for tests.
-    pub fn with_clock(mut self, now: fn() -> i64, sleep: fn(Duration)) -> Self {
-        self.now = now;
-        self.sleep = sleep;
+    /// The session as it stands, renewals included.
+    pub fn session(&self) -> SmartSession {
+        self.current.lock().expect("the session").clone()
+    }
+
+    /// The bearer for the next request: the current token, renewed first
+    /// when it has lapsed or was refused before, or after athenahealth
+    /// refused `refused`, a renewed one.
+    pub fn bearer(&self, refused: Option<&Secret>) -> Result<Secret, CliError> {
+        let at = now();
+        let current = self.session();
+        let presented = match refused {
+            Some(refused) => refused.expose().to_string(),
+            None if current.refused_at.is_some()
+                || current.tokens.is_expired(at, DEFAULT_SKEW_SECS) =>
+            {
+                current.tokens.access_token.clone()
+            }
+            None => return Ok(current.bearer()),
+        };
+        let client = ClientAuth::public(self.client_id.clone());
+        let renewer = Renewer::new(
+            &*self.store,
+            &self.lock,
+            &self.oauth,
+            &client,
+            &Athenahealth,
+        );
+        match renewer.after_refusal(&self.account, &presented, at) {
+            Ok(renewed) => {
+                let bearer = renewed.bearer();
+                *self.current.lock().expect("the session") = renewed;
+                Ok(bearer)
+            }
+            Err(e) => {
+                // The renewer stamped the stored session the same way, so the
+                // index the caller writes follows the keychain.
+                if e.reason() == Some(Reason::CredentialRefused) {
+                    self.current.lock().expect("the session").refused_at = Some(at);
+                }
+                Err(remedied(&current.organization, e))
+            }
+        }
+    }
+}
+
+/// A signed-in patient's reads against one FHIR server.
+pub struct Client {
+    fhir: FhirClient<BlockingTransport>,
+    live: Live,
+    org: String,
+    patient: String,
+    /// Requests in a row that ended, after their retries, in a 429, a 5xx,
+    /// an edge's block or a connection that failed. A `Cell`, so a page of
+    /// a search can fetch its `Binary` documents while the search goes on.
+    failures: Cell<u32>,
+}
+
+impl Client {
+    pub fn new(transport: BlockingTransport, live: Live) -> Result<Client, CliError> {
+        let session = live.session();
+        let source = live.clone();
+        let fhir = FhirClient::new(transport, &session.fhir_base, BIN, VERSION)?
+            .bearer_with(move |refused| source.bearer(refused))
+            .retry(retry_policy())
+            .page_cap(PAGE_CAP);
+        Ok(Client {
+            fhir,
+            live,
+            org: session.organization,
+            patient: session.patient.unwrap_or_default(),
+            failures: Cell::new(0),
+        })
+    }
+
+    /// Told of each wait before a retry, with one line for a person.
+    pub fn on_retry(mut self, report: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.fhir = self.fhir.on_retry(report);
+        self
+    }
+
+    /// Replace the sleep between retries, for tests.
+    pub fn sleeper(mut self, sleep: fn(Duration)) -> Self {
+        self.fhir = self.fhir.sleeper(sleep);
         self
     }
 
     pub fn base(&self) -> &str {
-        &self.tokens.fhir_base
+        self.fhir.base()
     }
 
     /// The practice profile this sign-in belongs to.
     pub fn org(&self) -> &str {
-        self.key.split('/').next().unwrap_or_default()
+        &self.org
     }
 
     pub fn patient(&self) -> &str {
-        &self.tokens.patient
+        &self.patient
     }
 
-    pub fn tokens(&self) -> &TokenSet {
-        &self.tokens
+    /// The session as it stands after this client's renewals, for the index.
+    pub fn session(&self) -> SmartSession {
+        self.live.session()
     }
 
-    /// The absolute URL of a path relative to the FHIR base, or an absolute
-    /// URL on the base's origin. Anything else gets no token.
-    pub fn resolve(&self, path_or_url: &str) -> Result<String, CliError> {
-        if path_or_url.starts_with("https://") || path_or_url.starts_with("http://") {
-            if same_origin(path_or_url, &self.tokens.fhir_base) {
-                return Ok(path_or_url.to_string());
-            }
-            return Err(CliError::Usage(
-                "that URL is not on the signed-in FHIR server; athena sends its token nowhere else"
-                    .into(),
-            ));
-        }
-        Ok(format!(
-            "{}/{}",
-            self.tokens.fhir_base.trim_end_matches('/'),
-            path_or_url.trim_start_matches('/')
-        ))
+    /// `GET <base>/<type>/<id>`.
+    pub fn read(&self, resource_type: &str, id: &str) -> Result<RawResource, CliError> {
+        let result = block_on(self.fhir.read(resource_type, id));
+        self.settle(result)
     }
 
-    /// GET with the bearer token: renewed first when it has expired, renewed
-    /// and retried once on a 401, and retried after a 502 to 504, or a 429
-    /// that says when to come back.
-    pub fn get(&mut self, url: &str, accept: &str) -> Result<HttpResponse, CliError> {
-        if self.tokens.access_expired((self.now)()) {
-            let presented = self.tokens.access_token.clone();
-            self.renew(&presented)?;
-        }
-        let mut renewed = false;
-        let mut attempt = 0;
-        loop {
-            let presented = self.tokens.access_token.clone();
-            let response = match self.http.call(
-                request("GET", url)
-                    .header("Accept", accept)
-                    .header("Authorization", format!("Bearer {presented}")),
-            ) {
-                Ok(response) => response,
-                Err(e) => {
-                    self.failures += 1;
-                    return Err(e);
-                }
-            };
-            match response.status {
-                401 if !renewed => {
-                    renewed = true;
-                    self.renew(&presented)?;
-                }
-                // athenahealth: retry 502, 503 and 504 with exponential
-                // backoff and jitter; retry a 429 only when it is about
-                // concurrency, not a daily limit. A 429 with a short
-                // `Retry-After` is the first; one without is left alone.
-                502..=504 if attempt < RETRIES => {
-                    attempt += 1;
-                    let wait = response
-                        .retry_after(crate::unix_now())
-                        .unwrap_or_else(|| backoff(attempt))
-                        .min(MAX_WAIT);
-                    (self.sleep)(wait);
-                }
-                429 if attempt < RETRIES => match response.retry_after(crate::unix_now()) {
-                    Some(wait) if wait <= MAX_WAIT => {
-                        attempt += 1;
-                        (self.sleep)(wait);
-                    }
-                    _ => return Ok(self.settled(response)),
-                },
-                _ => return Ok(self.settled(response)),
-            }
-        }
+    /// A `Binary` by its reference (`Binary/<id>`, or an absolute URL on the
+    /// FHIR server's origin), as FHIR JSON.
+    pub fn binary(&self, reference: &str) -> Result<RawResource, CliError> {
+        let result = block_on(self.fhir.binary(reference));
+        self.settle(result)
     }
 
-    /// Count a final answer toward the circuit breaker: the server is up
-    /// when it answers anything but a 429 or a 5xx.
-    fn settled(&mut self, response: HttpResponse) -> HttpResponse {
-        if response.status == 429 || response.status >= 500 {
-            self.failures += 1;
-        } else {
-            self.failures = 0;
-        }
-        response
+    /// Search `resource_type` with `params`, following `link[next]` on the
+    /// server's origin up to [`PAGE_CAP`] pages.
+    pub fn search(
+        &self,
+        resource_type: &str,
+        params: &[(&str, String)],
+    ) -> Result<SearchResult, CliError> {
+        let result = block_on(self.fhir.search(resource_type, params));
+        self.settle(result)
     }
 
-    /// [`check`], with a refused token's remedy naming this sign-in's
-    /// practice profile.
-    pub fn check(&self, response: &HttpResponse, what: &str) -> Result<(), CliError> {
-        let origin = crate::http::origin(self.base()).unwrap_or_else(|| self.base().to_string());
-        check(response, what, &origin, (self.now)()).map_err(|e| {
-            if e.reason() == Some(Reason::CredentialRefused) {
-                let org = self.org();
-                e.with_remedy(format!(
-                    "sign in again with `athena auth login --org {org}`"
-                ))
-            } else {
-                e
-            }
-        })
+    /// [`Self::search`], handing each page to `on_page` as it is read. A
+    /// page that fails ends the search with its error, after the pages
+    /// before it were handed over; an error from `on_page` ends it too.
+    pub fn search_pages(
+        &self,
+        resource_type: &str,
+        params: &[(&str, String)],
+        on_page: impl FnMut(SearchPage) -> Result<(), CliError>,
+    ) -> Result<SearchEnd, CliError> {
+        let result = block_on(self.fhir.search_pages(resource_type, params, on_page));
+        self.settle(result)
+    }
+
+    /// The body of a `GET` of a path under the base, or an absolute URL on
+    /// its origin.
+    pub fn get_raw(&self, path: &str) -> Result<String, CliError> {
+        let result = block_on(self.fhir.get_raw(path));
+        self.settle(result)
     }
 
     /// Whether the last [`BREAKER`] requests all failed, so a pull should
     /// stop rather than call a server that is down.
     pub fn tripped(&self) -> bool {
-        self.failures >= BREAKER
+        self.failures.get() >= BREAKER
     }
 
-    /// Renew the access token under the refresh lock. `presented` is the
-    /// token the server refused or that expired: when the stored one differs,
-    /// another process renewed meanwhile and its token is used instead.
-    fn renew(&mut self, presented: &str) -> Result<(), CliError> {
-        let http = self.http;
-        let store = self.store;
-        let key = self.key.clone();
-        let now = self.now;
-        let org = key.split('/').next().unwrap_or_default().to_string();
-        let sign_in_again = format!("sign in again with `athena auth login --org {org}`");
-        let read = || {
-            store.get(&key)?.ok_or_else(|| {
-                CliError::Auth("this patient was signed out meanwhile".into())
-                    .because(Reason::NoCredential)
-                    .with_remedy(sign_in_again.clone())
-            })
-        };
-        let due = |latest: &TokenSet| latest.access_token == presented;
-        // The sign-in as marked unusable after a refused refresh, so the
-        // caller's index follows the keychain.
-        let dead_set = std::cell::RefCell::new(None);
-        let grant = |latest: TokenSet| -> Result<TokenSet, CliError> {
-            let refresh_token = latest.refresh_token.clone().ok_or_else(|| {
-                CliError::Auth("the sign-in has expired and holds no refresh token".into())
-                    .because(Reason::CredentialRefused)
-                    .with_remedy(sign_in_again.clone())
-            })?;
-            let response = match oauth::refresh_grant(
-                http,
-                &latest.token_endpoint,
-                &latest.client_id,
-                &refresh_token,
-                &latest.scope,
-            ) {
-                Ok(response) => response,
-                Err(e) if e.reason() == Some(Reason::CredentialRefused) => {
-                    // The refresh token is dead: keep the item, but without
-                    // it, so `auth status` reports the sign-in as unusable.
-                    let dead = TokenSet {
-                        refresh_token: None,
-                        expires_at: now(),
-                        ..latest
-                    };
-                    let e = match store.set(&key, &dead) {
-                        Ok(()) => e,
-                        Err(write) => CliError::Auth(format!(
-                            "{}; marking the stored sign-in unusable failed too ({}), so `athena \
-                             auth status` may still call it usable",
-                            e.message(),
-                            write.message()
-                        ))
-                        .because(Reason::CredentialRefused),
-                    };
-                    *dead_set.borrow_mut() = Some(dead);
-                    return Err(e.with_remedy(sign_in_again.clone()));
-                }
-                Err(e) => return Err(e),
-            };
-            let fresh = latest.renewed(response, now());
-            store.set(&key, &fresh)?;
-            Ok(fresh)
-        };
-        let renewed = match self.lock {
-            Some(lock) => lock.renew(read, due, grant),
-            None => read().and_then(|latest| {
-                if due(&latest) {
-                    grant(latest)
-                } else {
-                    Ok(latest)
-                }
-            }),
-        };
-        if let Some(dead) = dead_set.into_inner() {
-            self.tokens = dead;
+    /// Count the answer toward the breaker, and name the practice profile in
+    /// a sign-in's remedy.
+    fn settle<T>(&self, result: Result<T, CliError>) -> Result<T, CliError> {
+        match &result {
+            Err(e) if server_trouble(e) => self.failures.set(self.failures.get() + 1),
+            _ => self.failures.set(0),
         }
-        self.tokens = renewed?;
-        Ok(())
-    }
-
-    /// Read one resource (`Patient/a-1.E-2`): its JSON text as served.
-    pub fn read(&mut self, reference: &str) -> Result<String, CliError> {
-        let url = self.resolve(reference)?;
-        let response = self.get(&url, FHIR_JSON)?;
-        self.check(&response, reference)?;
-        Ok(response.body)
-    }
-
-    /// Search `resource_type` with `params`, following `link[next]` up to
-    /// [`PAGE_CAP`] pages. `each` gets every matched or included resource's
-    /// JSON text. Returns whether the cap cut the search short.
-    pub fn search(
-        &mut self,
-        resource_type: &str,
-        params: &[(&str, String)],
-        mut each: impl FnMut(&mut Self, &RawValue) -> Result<(), CliError>,
-    ) -> Result<SearchEnd, CliError> {
-        let mut url = self.resolve(resource_type)?;
-        let mut first = true;
-        for (name, value) in params {
-            url.push(if first { '?' } else { '&' });
-            first = false;
-            url.push_str(&pk_cli_core::transport::percent_encode(name));
-            url.push('=');
-            url.push_str(&pk_cli_core::transport::percent_encode(value));
-        }
-        for _ in 0..PAGE_CAP {
-            let response = self.get(&url, FHIR_JSON)?;
-            self.check(&response, resource_type)?;
-            let page: Page<'_> = serde_json::from_str(&response.body).map_err(|e| {
-                CliError::Upstream(format!(
-                    "a {resource_type} search answered with something other than a Bundle: {e}"
-                ))
-            })?;
-            if page.resource_type != "Bundle" {
-                return Err(CliError::Upstream(format!(
-                    "a {resource_type} search answered with a {} instead of a Bundle",
-                    page.resource_type
-                )));
-            }
-            for entry in &page.entry {
-                let mode = entry
-                    .search
-                    .as_ref()
-                    .and_then(|s| s.mode.as_deref())
-                    .unwrap_or("match");
-                if mode == "outcome" {
-                    continue;
-                }
-                if let Some(resource) = entry.resource {
-                    each(self, resource)?;
-                }
-            }
-            let next = page
-                .link
-                .iter()
-                .find(|l| l.relation == "next")
-                .map(|l| l.url.clone());
-            match next {
-                None => return Ok(SearchEnd::Complete),
-                Some(next) if same_origin(&next, &self.tokens.fhir_base) => url = next,
-                Some(_) => {
-                    return Err(CliError::Upstream(format!(
-                        "a {resource_type} search's next page is on another host; athena sends \
-                         its token nowhere else"
-                    )))
-                }
-            }
-        }
-        Ok(SearchEnd::PageCap)
+        result.map_err(|e| remedied(&self.org, e))
     }
 }
 
-/// 1 s, 2 s, 4 s, ... plus up to a quarter of that again, from the clock's
-/// sub-second digits (jitter needs no more randomness than that).
-fn backoff(attempt: u32) -> Duration {
-    let base = Duration::from_secs(1u64 << (attempt - 1).min(5));
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    base + base.mul_f64(f64::from(nanos % 1000) / 4000.0)
-}
-
-/// How a search ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchEnd {
-    Complete,
-    PageCap,
-}
-
-#[derive(Deserialize)]
-struct Page<'a> {
-    #[serde(rename = "resourceType", default)]
-    resource_type: String,
-    #[serde(default)]
-    link: Vec<Link>,
-    #[serde(default, borrow)]
-    entry: Vec<Entry<'a>>,
-}
-
-#[derive(Deserialize)]
-struct Link {
-    #[serde(default)]
-    relation: String,
-    #[serde(default)]
-    url: String,
-}
-
-#[derive(Deserialize)]
-struct Entry<'a> {
-    #[serde(default, borrow)]
-    resource: Option<&'a RawValue>,
-    #[serde(default)]
-    search: Option<EntrySearch>,
-}
-
-#[derive(Deserialize)]
-struct EntrySearch {
-    #[serde(default)]
-    mode: Option<String>,
-}
-
-/// Map a FHIR answer onto the exit-code contract with medical-common's
-/// `status_error`: by the OperationOutcome's issue code when it has one the
-/// contract knows, otherwise by the HTTP status. A 429, a 5xx or an HTML 403
-/// (athenahealth's edge, not the FHIR server) is Upstream with no reason.
-/// `origin` names the server in the message; `now` is Unix seconds.
-pub fn check(response: &HttpResponse, what: &str, origin: &str, now: i64) -> Result<(), CliError> {
-    if response.is_success() {
-        return Ok(());
-    }
-    Err(pk_med_fhir::outcome::status_error(
-        what, origin, response, now,
-    ))
+/// Whether an error says the server is in trouble rather than answering: a
+/// connection that failed, or an answer that says nothing (a 429, a 5xx, an
+/// edge's HTML page), which `pk_med_fhir` gives the `try again later`
+/// remedy.
+fn server_trouble(error: &CliError) -> bool {
+    error.reason() == Some(UNREACHABLE) || error.remedy() == Some(TRY_AGAIN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pk_cli_core::transport::HttpResponse;
+    use pk_med_fhir::outcome::status_error;
 
     const ORIGIN: &str = "https://api.preview.platform.athenahealth.com";
 
     #[test]
-    fn statuses_map_to_exit_codes() {
-        let outcome = r#"{"resourceType":"OperationOutcome","issue":[{"code":"forbidden","diagnostics":"scope missing"}]}"#;
-        let forbidden =
-            check(&HttpResponse::new(403, outcome), "Observation", ORIGIN, 0).unwrap_err();
-        assert_eq!(forbidden.exit_code(), 3);
-        assert_eq!(forbidden.reason(), Some(Reason::Forbidden));
-        assert!(forbidden.message().contains("forbidden: scope missing"));
-        assert_eq!(
-            check(&HttpResponse::new(404, ""), "x", ORIGIN, 0)
-                .unwrap_err()
-                .exit_code(),
-            4
-        );
-        let bad = check(&HttpResponse::new(400, ""), "x", ORIGIN, 0).unwrap_err();
-        assert_eq!(
-            (bad.exit_code(), bad.reason()),
-            (5, Some(Reason::BadRequest))
-        );
-        assert_eq!(
-            check(&HttpResponse::new(500, "boom"), "x", ORIGIN, 0)
-                .unwrap_err()
-                .exit_code(),
-            5
-        );
-        assert!(check(&HttpResponse::new(200, "{}"), "x", ORIGIN, 0).is_ok());
-        let throttled = check(&HttpResponse::new(429, ""), "x", ORIGIN, 0).unwrap_err();
-        assert_eq!((throttled.exit_code(), throttled.reason()), (5, None));
-        let edge = HttpResponse::new(403, "<html>blocked</html>")
-            .header("content-type", "text/html; charset=utf-8");
-        let edge = check(&edge, "x", ORIGIN, 0).unwrap_err();
-        assert_eq!((edge.exit_code(), edge.reason()), (5, None));
+    fn the_retry_policy_is_athenahealths() {
+        let policy = retry_policy();
+        assert_eq!(policy.attempts, 4);
+        assert_eq!(policy.delay, Duration::from_secs(1));
+        assert_eq!(policy.max_wait, Duration::from_secs(30));
     }
 
     #[test]
-    fn backoff_doubles_with_a_little_jitter() {
-        for (attempt, low) in [(1u32, 1u64), (2, 2), (3, 4)] {
-            let wait = backoff(attempt);
-            assert!(wait >= Duration::from_secs(low), "{attempt}: {wait:?}");
-            assert!(
-                wait <= Duration::from_secs(low).mul_f64(1.25),
-                "{attempt}: {wait:?}"
-            );
-        }
+    fn only_a_server_in_trouble_counts_toward_the_breaker() {
+        let answer =
+            |status, body: &str| status_error("x", ORIGIN, &HttpResponse::new(status, body), 0);
+        assert!(server_trouble(&answer(503, "")));
+        assert!(server_trouble(&answer(429, "")));
+        let edge = HttpResponse::new(403, "<html>blocked</html>")
+            .header("content-type", "text/html; charset=utf-8");
+        assert!(server_trouble(&status_error("x", ORIGIN, &edge, 0)));
+        assert!(server_trouble(
+            &CliError::Upstream("connection refused".into()).because(UNREACHABLE)
+        ));
+        let forbidden = r#"{"resourceType":"OperationOutcome","issue":[{"code":"forbidden"}]}"#;
+        assert!(!server_trouble(&answer(403, forbidden)));
+        assert!(!server_trouble(&answer(400, "")));
+        assert!(!server_trouble(&answer(404, "")));
+        assert!(!server_trouble(&CliError::Upstream(
+            "expected a FHIR Bundle, found Patient".into()
+        )));
+    }
+
+    #[test]
+    fn a_refused_sign_in_names_the_profile_to_sign_in_again() {
+        let refused = remedied("clinic", answer_401());
+        assert_eq!(refused.exit_code(), 3);
+        assert!(refused
+            .to_string()
+            .contains("athena auth login --org clinic"));
+        let other = remedied("clinic", CliError::NotFound("x".into()));
+        assert!(!other.to_string().contains("auth login"));
+    }
+
+    fn answer_401() -> CliError {
+        status_error("Patient", ORIGIN, &HttpResponse::new(401, ""), 0)
     }
 }

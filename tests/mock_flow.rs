@@ -4,6 +4,8 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -11,12 +13,14 @@ use athena::config::Practice;
 use athena::documents;
 use athena::env::Environment;
 use athena::export;
-use athena::fhir::Client;
+use athena::fhir::{Client, Live};
 use athena::login;
-use athena::session::{key, MemoryStore, TokenSet, TokenStore};
+use athena::session::{self, key, MemoryStore};
 use athena::stream;
-use pk_cli_core::{CliError, RangeArgs};
+use pk_cli_auth::refresh_lock::RefreshLock;
+use pk_cli_core::{CliError, RangeArgs, Reason};
 use pk_cli_http::BlockingTransport;
+use pk_med_smart::{SessionStore, SmartSession};
 use serde_json::Value;
 use support::mock::{self, Mock};
 
@@ -33,6 +37,7 @@ fn prepare(m: &Mock, http: &BlockingTransport) -> login::Pending {
     login::prepare(
         http,
         &login::Request {
+            org: "mock",
             practice: &practice(m),
             org_name: "Mock practice",
             client_id: mock::CLIENT_ID,
@@ -43,44 +48,62 @@ fn prepare(m: &Mock, http: &BlockingTransport) -> login::Pending {
     .expect("prepare the sign-in")
 }
 
-fn sign_in(m: &Mock, http: &BlockingTransport) -> TokenSet {
+fn now() -> u64 {
+    athena::unix_now() as u64
+}
+
+fn sign_in(m: &Mock, http: &BlockingTransport) -> SmartSession {
     let pending = prepare(m, http);
     let start = pending.start_url();
     let browser = thread::spawn(move || mock::click_through(&start));
-    let outcome = pending
-        .finish(http, athena::unix_now())
-        .expect("finish the sign-in");
+    let outcome = pending.finish(http, now()).expect("finish the sign-in");
     let page = browser.join().unwrap();
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("Signed in"));
+    assert!(page.body.contains("signed in"), "{}", page.body);
     assert_eq!(outcome.relationship, Some("proxy"));
-    outcome.tokens
+    outcome.session
 }
 
 fn no_sleep(_: Duration) {}
 
-fn client<'a>(
-    http: &'a BlockingTransport,
-    store: &'a MemoryStore,
-    tokens: &TokenSet,
-) -> Client<'a> {
-    let k = key("mock", &tokens.patient);
-    store.set(&k, tokens).unwrap();
-    Client::new(http, store, None, k, tokens.clone()).with_clock(athena::unix_now, no_sleep)
+/// A refresh lock of this test's own.
+fn lock() -> RefreshLock {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    RefreshLock::at(
+        std::env::temp_dir().join(format!("athena-mock-flow-{}-{n}.lock", std::process::id())),
+    )
 }
 
-fn header(tokens: &TokenSet) -> stream::Header {
+/// The session stored in `store`, and a client over it.
+fn client(http: &BlockingTransport, store: &Arc<MemoryStore>, signed_in: &SmartSession) -> Client {
+    store.save(signed_in).unwrap();
+    let live = Live::start(store.clone(), lock(), http.clone(), signed_in.clone())
+        .expect("start the session");
+    Client::new(http.clone(), live)
+        .expect("a client")
+        .sleeper(no_sleep)
+}
+
+fn stored(store: &MemoryStore) -> SmartSession {
+    store
+        .load(&key("mock", mock::PATIENT))
+        .unwrap()
+        .expect("a stored session")
+}
+
+fn header(signed_in: &SmartSession) -> stream::Header {
     stream::header(
         stream::Organization {
             id: "mock".into(),
             name: "Mock practice".into(),
-            fhir_base: tokens.fhir_base.clone(),
+            fhir_base: signed_in.fhir_base.clone(),
             vendor: Some(stream::VENDOR.into()),
             location: None,
             aliases: Vec::new(),
         },
         stream::PatientContext {
-            id: tokens.patient.clone(),
+            id: signed_in.patient.clone().unwrap_or_default(),
             organization: "mock".into(),
             label: Some("kid".into()),
             relationship: Some("proxy".into()),
@@ -98,17 +121,17 @@ fn header(tokens: &TokenSet) -> stream::Header {
 /// One export into memory, as `athena records export --ndjson` writes it:
 /// the stream's text, and the error that cut it short (recorded in the
 /// trailer as `complete: false`).
-fn pull(c: &mut Client<'_>, tokens: &TokenSet) -> (String, Result<(), CliError>) {
-    pull_since(c, tokens, None)
+fn pull(c: &Client, signed_in: &SmartSession) -> (String, Result<(), CliError>) {
+    pull_since(c, signed_in, None)
 }
 
 fn pull_since(
-    c: &mut Client<'_>,
-    tokens: &TokenSet,
+    c: &Client,
+    signed_in: &SmartSession,
     since: Option<&str>,
 ) -> (String, Result<(), CliError>) {
     let mut buf = Vec::new();
-    let mut header = header(tokens);
+    let mut header = header(signed_in);
     header.since = since.map(str::to_string);
     let (_, error) = export::write_stream(
         &mut buf,
@@ -138,12 +161,40 @@ fn a_caregiver_sign_in_gets_tokens_for_the_chosen_patient() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    assert_eq!(tokens.patient, mock::PATIENT);
+    assert_eq!(tokens.organization, "mock");
+    assert_eq!(tokens.patient.as_deref(), Some(mock::PATIENT));
+    assert_eq!(tokens.account(), key("mock", mock::PATIENT));
     assert_eq!(tokens.fhir_user.as_deref(), Some(mock::FHIR_USER));
-    assert!(tokens.refresh_token.is_some());
-    assert!(tokens.scope.contains("patient/DocumentReference.read"));
+    assert_eq!(tokens.client_id, mock::CLIENT_ID);
+    assert!(tokens.tokens.refresh_token.is_some());
+    assert!(tokens
+        .tokens
+        .scope
+        .as_deref()
+        .unwrap()
+        .contains("patient/DocumentReference.read"));
     // expires_in came as the string "3600".
-    assert!(tokens.expires_at > athena::unix_now() + 3000);
+    assert!(tokens.tokens.expires_at.unwrap() > now() + 3000);
+    assert_eq!(
+        session::revocation_endpoint(&tokens),
+        Some(format!("{}/oauth2/v1/revoke", m.origin()).as_str())
+    );
+    assert!(session::usable(&tokens, now()));
+}
+
+#[test]
+fn an_id_token_for_another_sign_in_is_refused() {
+    let m = Mock::start(0);
+    m.set_mode("nonce");
+    let http = BlockingTransport::new().unwrap();
+    let pending = prepare(&m, &http);
+    let start = pending.start_url();
+    let browser = thread::spawn(move || mock::click_through(&start));
+    let err = pending.finish(&http, now()).err().expect("a refusal");
+    browser.join().unwrap();
+    assert_eq!(err.exit_code(), 3);
+    assert_eq!(err.reason(), Some(Reason::CredentialRefused));
+    assert!(err.message().contains("nonce"), "{err}");
 }
 
 #[test]
@@ -151,9 +202,9 @@ fn the_export_streams_every_resource_with_binaries_after_their_parents() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
-    let (text, result) = pull(&mut c, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
+    let (text, result) = pull(&c, &tokens);
     result.expect("export");
     let out = lines(&text);
 
@@ -233,9 +284,9 @@ fn numbers_reach_the_stream_as_the_server_wrote_them() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
-    let (text, result) = pull(&mut c, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
+    let (text, result) = pull(&c, &tokens);
     result.unwrap();
     let weight = text
         .lines()
@@ -253,21 +304,46 @@ fn an_expired_token_is_renewed_once_with_the_granted_scope() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
     m.expire_access_tokens();
-    c.read(&format!("Patient/{}", mock::PATIENT))
+    c.read("Patient", mock::PATIENT)
         .expect("read after renewal");
     assert_eq!(m.refresh_grants(), 1);
     let scope = &m.refresh_scopes()[0];
     assert!(scope.contains("launch/patient") && scope.contains("patient/Patient.read"));
-    let stored = store.get(&key("mock", mock::PATIENT)).unwrap().unwrap();
-    assert_ne!(stored.access_token, tokens.access_token);
+    let stored = stored(&store);
+    assert_ne!(stored.tokens.access_token, tokens.tokens.access_token);
     assert_eq!(
-        stored.refresh_token, tokens.refresh_token,
+        stored.tokens.refresh_token, tokens.tokens.refresh_token,
         "the refresh token is kept"
     );
-    assert!(stored.refreshed_at >= tokens.refreshed_at);
+    assert!(stored.tokens.obtained_at >= tokens.tokens.obtained_at);
+    assert_eq!(
+        c.session().tokens.access_token,
+        stored.tokens.access_token,
+        "the client holds what the keychain holds"
+    );
+}
+
+#[test]
+fn a_lapsed_token_is_renewed_before_the_first_request() {
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let mut tokens = sign_in(&m, &http);
+    tokens.tokens.expires_at = Some(now() - 1);
+    let store = Arc::new(MemoryStore::default());
+    let before = m.requests().len();
+    let c = client(&http, &store, &tokens);
+    assert_eq!(m.refresh_grants(), 1, "renewed when the client started");
+    c.read("Patient", mock::PATIENT).expect("read");
+    let fhir: Vec<_> = m.requests()[before..]
+        .iter()
+        .filter(|(_, p)| p.starts_with("/fhir/"))
+        .cloned()
+        .collect();
+    assert_eq!(fhir.len(), 1, "no refused request first: {fhir:?}");
+    assert!(stored(&store).tokens.expires_at.unwrap() > now());
 }
 
 #[test]
@@ -275,11 +351,11 @@ fn a_revoked_sign_in_ends_the_stream_incomplete_with_exit_3() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
     m.expire_access_tokens();
     m.set_mode("revoked");
-    let (text, result) = pull(&mut c, &tokens);
+    let (text, result) = pull(&c, &tokens);
     let err = result.unwrap_err();
     assert_eq!(err.exit_code(), 3);
     assert!(
@@ -290,13 +366,19 @@ fn a_revoked_sign_in_ends_the_stream_incomplete_with_exit_3() {
     let trailer = out.last().unwrap();
     assert_eq!(trailer["complete"], false);
     assert_eq!(trailer["error"]["code"], err.code());
-    // The dead refresh token is dropped, so status reports the sign-in unusable.
-    let stored = store.get(&key("mock", mock::PATIENT)).unwrap().unwrap();
-    assert!(stored.refresh_token.is_none());
-    assert!(!stored.usable(athena::unix_now()));
-    // The client holds the same marked set, which is what the caller writes
-    // into the session index.
-    assert_eq!(c.tokens(), &stored);
+    // The refusal is stamped on the stored sign-in, so status reports it
+    // unusable; the refresh token is kept, in case the server takes it back.
+    let stored = stored(&store);
+    assert!(stored.refused_at.is_some());
+    assert!(stored.tokens.refresh_token.is_some());
+    assert!(!session::usable(&stored, now()));
+    // The client holds the same stamp, which is what the caller writes into
+    // the session index.
+    assert!(c.session().refused_at.is_some());
+    assert_eq!(
+        session::signin_expires_at(&c.session()),
+        c.session().refused_at.unwrap()
+    );
 }
 
 #[test]
@@ -304,11 +386,11 @@ fn a_server_that_is_down_fails_the_export_after_retries() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
     m.set_mode("down");
     let before = m.requests().len();
-    let (text, result) = pull(&mut c, &tokens);
+    let (text, result) = pull(&c, &tokens);
     let err = result.expect_err("no patient, no export");
     assert_eq!(err.exit_code(), 5);
     let out = lines(&text);
@@ -328,10 +410,10 @@ fn a_refused_patient_read_ends_the_export_as_a_sign_in_problem() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
     m.set_mode("forbidden");
-    let (text, result) = pull(&mut c, &tokens);
+    let (text, result) = pull(&c, &tokens);
     let err = result.expect_err("refused");
     assert_eq!(err.exit_code(), 3);
     assert!(err.to_string().contains("turned off access"), "{err}");
@@ -346,11 +428,11 @@ fn failing_searches_trip_the_breaker() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
     m.set_mode("degraded");
     let before = m.requests().len();
-    let (text, result) = pull(&mut c, &tokens);
+    let (text, result) = pull(&c, &tokens);
     let err = result.expect_err("the breaker trips");
     assert_eq!(err.exit_code(), 5);
     assert!(err.to_string().contains("in a row"), "{err}");
@@ -378,13 +460,15 @@ fn a_cancelled_sign_in_is_exit_3() {
     let pending = prepare(&m, &http);
     let start = pending.start_url();
     let browser = thread::spawn(move || mock::click_through(&start));
-    let err = pending
-        .finish(&http, athena::unix_now())
-        .err()
-        .expect("a refusal");
+    let err = pending.finish(&http, now()).err().expect("a refusal");
     assert_eq!(err.exit_code(), 3);
-    assert!(err.message().contains("cancelled"));
-    assert_eq!(browser.join().unwrap().status, 400);
+    assert!(err.message().contains("access_denied"), "{err}");
+    assert!(
+        err.to_string().contains("athena auth login --org mock"),
+        "{err}"
+    );
+    let page = browser.join().unwrap();
+    assert!(page.body.contains("did not complete"), "{}", page.body);
 }
 
 #[test]
@@ -392,9 +476,9 @@ fn documents_are_listed_newest_first_and_checked_on_download() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
-    let items = documents::list(&mut c, &RangeArgs::default()).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
+    let items = documents::list(&c, &RangeArgs::default()).unwrap();
     let ids: Vec<&str> = items.iter().map(|i| i.document.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -406,26 +490,26 @@ fn documents_are_listed_newest_first_and_checked_on_download() {
         ]
     );
 
-    let pdf = documents::fetch(&mut c, &items[1]).ok().unwrap();
+    let pdf = documents::fetch(&c, &items[1]).ok().unwrap();
     assert!(pdf.bytes.starts_with(b"%PDF"));
-    let png = documents::fetch(&mut c, &items[0]).ok().unwrap();
+    let png = documents::fetch(&c, &items[0]).ok().unwrap();
     assert!(png.bytes.starts_with(b"\x89PNG"));
     assert_eq!(documents::extension(png.content_type.as_deref()), "png");
-    let html = documents::fetch(&mut c, &items[2]).err().unwrap();
+    let html = documents::fetch(&c, &items[2]).err().unwrap();
     assert_eq!(html.code, "verify_failed");
-    let elsewhere = documents::fetch(&mut c, &items[3]).err().unwrap();
+    let elsewhere = documents::fetch(&c, &items[3]).err().unwrap();
     assert_eq!(elsewhere.code, "no_file");
 
-    let found = documents::find(&mut c, "DocumentReference/doc-2#1").unwrap();
+    let found = documents::find(&c, "DocumentReference/doc-2#1").unwrap();
     assert_eq!(found.document.id, "DocumentReference/doc-2#1");
     assert_eq!(
-        documents::find(&mut c, "DocumentReference/doc-2#3")
+        documents::find(&c, "DocumentReference/doc-2#3")
             .unwrap_err()
             .exit_code(),
         4
     );
     assert_eq!(
-        documents::find(&mut c, "DocumentReference/none")
+        documents::find(&c, "DocumentReference/none")
             .unwrap_err()
             .exit_code(),
         4
@@ -435,7 +519,7 @@ fn documents_are_listed_newest_first_and_checked_on_download() {
         since: Some("2026-02-01".into()),
         ..RangeArgs::default()
     };
-    assert_eq!(documents::list(&mut c, &since).unwrap().len(), 2);
+    assert_eq!(documents::list(&c, &since).unwrap().len(), 2);
 }
 
 #[test]
@@ -443,15 +527,19 @@ fn a_token_goes_nowhere_but_its_own_server() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
+    let store = Arc::new(MemoryStore::default());
     let c = client(&http, &store, &tokens);
-    assert_eq!(
-        c.resolve("https://elsewhere.example/fhir/r4/Patient/x")
-            .unwrap_err()
-            .exit_code(),
-        2
-    );
-    assert!(c.resolve(&format!("{}/Patient/x", m.fhir_base())).is_ok());
+    let before = m.requests().len();
+    assert!(c
+        .get_raw("https://elsewhere.example/fhir/r4/Patient/x")
+        .is_err());
+    assert!(c
+        .binary("https://elsewhere.example/fhir/r4/Binary/x")
+        .is_err());
+    assert_eq!(m.requests().len(), before, "nothing was sent");
+    assert!(c
+        .get_raw(&format!("{}/Patient/{}", m.fhir_base(), mock::PATIENT))
+        .is_ok());
 }
 
 #[test]
@@ -460,9 +548,9 @@ fn the_stream_reads_back_with_the_consumers_reader() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
-    let (text, result) = pull(&mut c, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
+    let (text, result) = pull(&c, &tokens);
     result.expect("export");
     let mut reader = RecordsReader::new(std::io::BufReader::new(text.as_bytes()));
     assert_eq!(reader.header().unwrap().source.cli, "athena");
@@ -485,7 +573,7 @@ fn the_stream_reads_back_with_the_consumers_reader() {
         .collect();
     assert!(searches.contains(&"ServiceRequest"), "{searches:?}");
     for search in searches {
-        assert!(!search.contains(&tokens.patient), "{search}");
+        assert!(!search.contains(mock::PATIENT), "{search}");
     }
 }
 
@@ -494,9 +582,9 @@ fn a_since_pull_names_the_bound_in_skipped_searches() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
-    let (text, result) = pull_since(&mut c, &tokens, Some("2026-01-01"));
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
+    let (text, result) = pull_since(&c, &tokens, Some("2026-01-01"));
     result.expect("export");
     let out = lines(&text);
     assert_eq!(out[0]["since"], "2026-01-01");
@@ -510,7 +598,7 @@ fn a_since_pull_names_the_bound_in_skipped_searches() {
         searches.contains(&"ServiceRequest?_lastUpdated=ge2026-01-01"),
         "{searches:?}"
     );
-    assert!(searches.iter().all(|s| !s.contains(&tokens.patient)));
+    assert!(searches.iter().all(|s| !s.contains(mock::PATIENT)));
 }
 
 #[test]
@@ -518,10 +606,10 @@ fn a_search_entry_that_does_not_read_is_a_skip_and_the_rest_is_kept() {
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
     m.set_mode("malformed");
-    let (text, result) = pull(&mut c, &tokens);
+    let (text, result) = pull(&c, &tokens);
     result.expect("export");
     let out = lines(&text);
     let trailer = out.last().unwrap();
@@ -544,22 +632,46 @@ fn a_search_entry_that_does_not_read_is_a_skip_and_the_rest_is_kept() {
 }
 
 #[test]
+fn a_search_page_that_fails_keeps_the_pages_before_it() {
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let tokens = sign_in(&m, &http);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
+    m.set_mode("page2-down");
+    let (text, result) = pull(&c, &tokens);
+    result.expect("a failed search is a skip, not the end");
+    let out = lines(&text);
+    let trailer = out.last().unwrap();
+    assert_eq!(trailer["complete"], true);
+    assert_eq!(trailer["counts"]["Observation"], 2, "page 1 is kept");
+    let observation: Vec<&Value> = trailer["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["resource_type"] == "Observation")
+        .collect();
+    assert_eq!(observation.len(), 1, "{trailer}");
+    assert_eq!(observation[0]["code"], "upstream");
+    assert_eq!(observation[0]["search"], "Observation");
+}
+
+#[test]
 fn an_export_to_a_directory_commits_complete_streams_and_keeps_the_last_one() {
     use pk_med_records::stream::{Item, RecordsReader, StreamError};
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
     let tokens = sign_in(&m, &http);
-    let store = MemoryStore::default();
-    let mut c = client(&http, &store, &tokens);
+    let store = Arc::new(MemoryStore::default());
+    let c = client(&http, &store, &tokens);
     let dir = scratch("out");
     let now = || "2026-01-01T00:00:01Z".to_string();
 
     let mut sizes = Vec::new();
     for _ in 0..2 {
-        let (export, error) = export::write_dir(&dir, &header(&tokens), now, |w| {
-            export::export(&mut c, w, None)
-        })
-        .unwrap();
+        let (export, error) =
+            export::write_dir(&dir, &header(&tokens), now, |w| export::export(&c, w, None))
+                .unwrap();
         assert!(error.is_none());
         let v = serde_json::to_value(&export).unwrap();
         assert_eq!(v["schema"], "records-export/v1");
@@ -594,10 +706,8 @@ fn an_export_to_a_directory_commits_complete_streams_and_keeps_the_last_one() {
     // A pull cut short goes to records.incomplete.ndjson, and the last
     // complete export stays.
     m.set_mode("degraded");
-    let (export, error) = export::write_dir(&dir, &header(&tokens), now, |w| {
-        export::export(&mut c, w, None)
-    })
-    .unwrap();
+    let (export, error) =
+        export::write_dir(&dir, &header(&tokens), now, |w| export::export(&c, w, None)).unwrap();
     assert_eq!(error.expect("cut short").exit_code(), 5);
     assert!(!export.complete);
     assert!(
@@ -622,10 +732,8 @@ fn an_export_to_a_directory_commits_complete_streams_and_keeps_the_last_one() {
     // The next complete export replaces records.ndjson and clears the
     // incomplete one.
     m.set_mode("normal");
-    let (export, error) = export::write_dir(&dir, &header(&tokens), now, |w| {
-        export::export(&mut c, w, None)
-    })
-    .unwrap();
+    let (export, error) =
+        export::write_dir(&dir, &header(&tokens), now, |w| export::export(&c, w, None)).unwrap();
     assert!(error.is_none() && export.complete);
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()

@@ -80,10 +80,16 @@ complete export, and exits with its error's code. v0.1.0 wrote a new
 3. athenahealth redirects to `http://127.0.0.1:47816/callback` (or `:47817`),
    where `athena` listens, and `athena` exchanges the code with PKCE.
 4. Access tokens last an hour and renew themselves; a sign-in lasts 90 days
-   from its last use. `auth status` shows when each one ends.
+   from its last use. `auth status` shows when each one ends, and when
+   athenahealth last refused one (`refused_at`).
 
 Tokens are one macOS Keychain item per patient (`piekstra.athena`, account
-`<practice profile>/<patient>`). Nothing secret is written anywhere else.
+`smart/<practice profile>/<patient>`). Nothing secret is written anywhere
+else. v0.3.0 moved sign-in onto medical-common's shared SMART library and
+renamed the account from `<practice profile>/<patient>`: a sign-in made with
+v0.2.x is not found by v0.3.0, so sign in again once (and `security
+delete-generic-password -s piekstra.athena -a <practice profile>/<patient>`
+removes the old item).
 
 ## What a patient token sees
 

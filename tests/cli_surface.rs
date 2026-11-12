@@ -555,5 +555,8 @@ fn org_and_patient_items_read_as_the_profiles_dtos() {
     let patient: PatientContext = serde_json::from_value(v["items"][0].clone()).unwrap();
     assert_eq!(patient.organization, "clinic");
     assert_eq!(patient.kind.as_deref(), Some("patient"));
-    assert_eq!(patient.session.as_deref(), Some("clinic/a-900001.E-1001"));
+    assert_eq!(
+        patient.session.as_deref(),
+        Some("smart/clinic/a-900001.E-1001")
+    );
 }

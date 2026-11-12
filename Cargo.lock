@@ -212,13 +212,12 @@ dependencies = [
 
 [[package]]
 name = "athena-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "base64 0.22.1",
  "clap",
  "clap_complete",
- "getrandom 0.3.4",
  "pk-cli-auth",
  "pk-cli-config",
  "pk-cli-core",
@@ -228,11 +227,12 @@ dependencies = [
  "pk-cli-selfupdate",
  "pk-med-fhir",
  "pk-med-records",
+ "pk-med-smart",
  "predicates",
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tempfile",
 ]
 
@@ -1525,8 +1525,8 @@ dependencies = [
 
 [[package]]
 name = "pk-med-fhir"
-version = "0.2.0"
-source = "git+https://github.com/piekstra/medical-common?tag=v0.2.0#10713394efd0aa1823df81c136bf6368770c9f7c"
+version = "0.4.1"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.4.1#63195a4bafb235729f900627909298ac98d1a2f5"
 dependencies = [
  "base64 0.22.1",
  "pk-cli-core",
@@ -1537,13 +1537,27 @@ dependencies = [
 
 [[package]]
 name = "pk-med-records"
-version = "0.2.0"
-source = "git+https://github.com/piekstra/medical-common?tag=v0.2.0#10713394efd0aa1823df81c136bf6368770c9f7c"
+version = "0.4.1"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.4.1#63195a4bafb235729f900627909298ac98d1a2f5"
 dependencies = [
  "pk-cli-core",
  "pk-med-fhir",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pk-med-smart"
+version = "0.4.1"
+source = "git+https://github.com/piekstra/medical-common?tag=v0.4.1#63195a4bafb235729f900627909298ac98d1a2f5"
+dependencies = [
+ "base64 0.22.1",
+ "pk-cli-auth",
+ "pk-cli-core",
+ "pk-cli-secrets",
+ "serde",
+ "serde_json",
+ "zeroize",
 ]
 
 [[package]]

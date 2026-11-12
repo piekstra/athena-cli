@@ -6,10 +6,9 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use pk_cli_core::{CliError, Reason};
-use serde_json::value::RawValue;
 use serde_json::Value;
 
-use crate::fhir::{self, Client, SearchEnd};
+use crate::fhir::{self, Client};
 use crate::http::same_origin;
 use crate::smart::{granted_types, PATIENT_TYPES};
 use pk_med_fhir::RawResource;
@@ -97,13 +96,13 @@ pub fn write_dir(
 /// Returns an error only for what ends the stream (a refused sign-in, a
 /// failed write); everything else becomes a skip.
 pub fn export<W: Write>(
-    client: &mut Client<'_>,
+    client: &Client,
     w: &mut Writer<W>,
     since: Option<&str>,
 ) -> Result<(), CliError> {
     let patient = client.patient().to_string();
     let granted = {
-        let g = granted_types(&client.tokens().scope);
+        let g = granted_types(client.session().tokens.scope.as_deref().unwrap_or_default());
         if g.is_empty() {
             // A token answer without `scope` grants what was asked for.
             PATIENT_TYPES.iter().map(|t| t.to_string()).collect()
@@ -114,10 +113,9 @@ pub fn export<W: Write>(
     let mut references = BTreeSet::new();
     let binary_granted = granted.contains("Binary");
 
-    let reference = format!("Patient/{patient}");
-    match client.read(&reference) {
-        Ok(body) => {
-            w.resource(&RawResource::parse(&body)?)?;
+    match client.read("Patient", &patient) {
+        Ok(resource) => {
+            w.resource(&resource)?;
         }
         // Without the patient there is no export. A refusal here, when the
         // sign-in asked for Patient, means access was withdrawn.
@@ -151,18 +149,53 @@ pub fn export<W: Write>(
         if let Some(since) = since {
             params.push(("_lastUpdated", format!("ge{since}")));
         }
-        let outcome = client.search(resource_type, &params, |client, raw| {
-            write_resource(client, w, raw, &mut references, binary_granted)
+        // Each page is written as it is read, its Binary documents after
+        // their parents, so a page that fails keeps the ones before it. What
+        // ends the stream from inside a page is kept apart from the search's
+        // own failure, which is a skip.
+        let mut stopped = None;
+        let outcome = client.search_pages(resource_type, &params, |page| {
+            for why in &page.unreadable {
+                w.skip(Skip {
+                    resource_type: None,
+                    id: None,
+                    search: Some(search.clone()),
+                    reason: format!("a search answered with an entry that did not read: {why}"),
+                    code: code::VERIFY_FAILED.into(),
+                });
+            }
+            for resource in page.resources.iter().chain(&page.included) {
+                if let Err(e) = write_resource(client, w, resource, &mut references, binary_granted)
+                {
+                    stopped = Some(e);
+                    return Err(CliError::Other("the export stopped".into()));
+                }
+            }
+            Ok(())
         });
+        if let Some(e) = stopped {
+            return Err(e);
+        }
         match outcome {
-            Ok(SearchEnd::Complete) => {}
-            Ok(SearchEnd::PageCap) => w.skip(Skip {
-                resource_type: Some(resource_type.to_string()),
-                id: None,
-                search: Some(search),
-                reason: format!("stopped after {} pages", fhir::PAGE_CAP),
-                code: code::PAGE_CAP.into(),
-            }),
+            Ok(found) => {
+                if found.truncated {
+                    w.skip(Skip {
+                        resource_type: Some(resource_type.to_string()),
+                        id: None,
+                        search: Some(search),
+                        reason: if found.pages >= fhir::PAGE_CAP {
+                            format!("stopped after {} pages", fhir::PAGE_CAP)
+                        } else {
+                            format!(
+                                "stopped after {} pages: the server named the last one as its \
+                                 own next page",
+                                found.pages
+                            )
+                        },
+                        code: code::PAGE_CAP.into(),
+                    });
+                }
+            }
             Err(e) => skip_or_fail(
                 w,
                 e,
@@ -191,55 +224,30 @@ pub fn export<W: Write>(
             });
             continue;
         }
-        match client.read(&reference) {
-            Ok(body) => match serde_json::from_str::<Box<RawValue>>(&body) {
-                Ok(raw) => {
-                    let mut more = BTreeSet::new();
-                    write_resource(client, w, &raw, &mut more, binary_granted)?;
-                }
-                Err(_) => w.skip(Skip {
-                    resource_type: Some(resource_type.into()),
-                    id: Some(id.into()),
-                    search: None,
-                    reason: "the server answered with something other than JSON".into(),
-                    code: code::VERIFY_FAILED.into(),
-                }),
-            },
+        match client.read(resource_type, id) {
+            Ok(resource) => {
+                let mut more = BTreeSet::new();
+                write_resource(client, w, &resource, &mut more, binary_granted)?;
+            }
             Err(e) => skip_or_fail(w, e, Some(resource_type), Some(id), None, client.tripped())?,
         }
     }
     Ok(())
 }
 
-/// Write one search result, note what it refers to, and fetch the `Binary`
+/// Write one resource, note what it refers to, and fetch the `Binary`
 /// documents it points at right after it.
 fn write_resource<W: Write>(
-    client: &mut Client<'_>,
+    client: &Client,
     w: &mut Writer<W>,
-    raw: &RawValue,
+    resource: &RawResource,
     references: &mut BTreeSet<String>,
     binary_granted: bool,
 ) -> Result<(), CliError> {
-    let resource = match RawResource::parse(raw.get()) {
-        Ok(resource) => resource,
-        Err(e) => {
-            w.skip(Skip {
-                resource_type: None,
-                id: None,
-                search: None,
-                reason: format!(
-                    "a search answered with an entry that did not read: {}",
-                    e.message()
-                ),
-                code: code::VERIFY_FAILED.into(),
-            });
-            return Ok(());
-        }
-    };
-    if !w.resource(&resource)? {
+    if !w.resource(resource)? {
         return Ok(());
     }
-    let Ok(value) = serde_json::from_str::<Value>(raw.get()) else {
+    let Ok(value) = resource.value() else {
         return Ok(());
     };
     collect_references(&value, client.base(), references);
@@ -250,7 +258,7 @@ fn write_resource<W: Write>(
 }
 
 fn fetch_binary<W: Write>(
-    client: &mut Client<'_>,
+    client: &Client,
     w: &mut Writer<W>,
     url: &str,
     granted: bool,
@@ -280,19 +288,10 @@ fn fetch_binary<W: Write>(
         });
         return Ok(());
     }
-    match client.read(url) {
-        Ok(body) => match RawResource::parse(&body) {
-            Ok(binary) if binary.resource_type == "Binary" => {
-                w.resource(&binary)?;
-            }
-            _ => w.skip(Skip {
-                resource_type: Some("Binary".into()),
-                id: Some(id),
-                search: None,
-                reason: "the server answered with something other than a Binary resource".into(),
-                code: code::VERIFY_FAILED.into(),
-            }),
-        },
+    match client.binary(url) {
+        Ok(binary) => {
+            w.resource(&binary)?;
+        }
         Err(e) => skip_or_fail(w, e, Some("Binary"), Some(&id), None, client.tripped())?,
     }
     Ok(())

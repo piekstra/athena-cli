@@ -1,21 +1,23 @@
-//! Signed-in patients: the token set in the keychain, one item per
-//! (practice profile, patient), and a non-secret index of which items exist.
+//! Signed-in patients: one `pk_med_smart::SmartSession` in the keychain per
+//! (practice profile, patient), at account `smart/<org>/<patient>`, and a
+//! non-secret index of which items exist.
 //!
 //! The index (`sessions.json` beside the config, owner-only) lets `patients
 //! list` and `--patient <label>` work without reading the keychain, which on
 //! macOS costs a permission prompt per item for each new build.
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::fmt;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use pk_cli_auth::token::DEFAULT_SKEW_SECS;
 use pk_cli_core::{CliError, Reason};
 use pk_cli_secrets::CredentialStore;
+use pk_med_smart::{SessionStore, SmartSession};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::env::Environment;
-use crate::oauth::TokenResponse;
 
 /// The keychain service. `ATHENA_KEYCHAIN_SERVICE` overrides it for tests
 /// only, so no test or `make verify` step reads the owner's real items.
@@ -24,193 +26,109 @@ pub const KEYCHAIN_SERVICE_ENV: &str = "ATHENA_KEYCHAIN_SERVICE";
 
 /// athenahealth: a refresh token expires 90 days after the most recent token
 /// request that used or generated it.
-pub const REFRESH_LIFETIME_SECS: i64 = 90 * 24 * 60 * 60;
+pub const REFRESH_LIFETIME_SECS: u64 = 90 * 24 * 60 * 60;
 
-/// Renew an access token this long before it expires.
-const EXPIRY_MARGIN_SECS: i64 = 60;
+/// Where a session keeps athenahealth's revocation endpoint, for `auth
+/// logout` (`SmartSession::extra`, which renewals carry over).
+pub const REVOCATION_ENDPOINT: &str = "revocation_endpoint";
 
-/// One patient's tokens at one practice profile: one keychain JSON item.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct TokenSet {
-    pub access_token: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
-    /// When the access token expires (Unix seconds).
-    pub expires_at: i64,
-    /// The scopes granted, sent again on every refresh (athenahealth requires it).
-    pub scope: String,
-    /// The FHIR `Patient.id` the sign-in chose.
-    pub patient: String,
-    pub client_id: String,
-    pub fhir_base: String,
-    pub token_endpoint: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revocation_endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issuer: Option<String>,
-    /// The id token's `fhirUser`: who signed in (a Patient, or a RelatedPerson
-    /// for a caregiver).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fhir_user: Option<String>,
-    /// The last token request that used or produced the refresh token.
-    pub refreshed_at: i64,
-}
-
-impl fmt::Debug for TokenSet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TokenSet")
-            .field("access_token", &"<redacted>")
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("expires_at", &self.expires_at)
-            .field("fhir_base", &self.fhir_base)
-            .finish_non_exhaustive()
-    }
-}
-
-impl TokenSet {
-    /// A token set from a code exchange.
-    pub fn from_response(response: TokenResponse, grant: Grant, now: i64) -> TokenSet {
-        TokenSet {
-            expires_at: now + response.expires_in.unwrap_or(3600),
-            access_token: response.access_token,
-            refresh_token: response.refresh_token,
-            scope: response.scope.unwrap_or_default(),
-            patient: grant.patient,
-            client_id: grant.client_id,
-            fhir_base: grant.fhir_base,
-            token_endpoint: grant.token_endpoint,
-            revocation_endpoint: grant.revocation_endpoint,
-            issuer: grant.issuer,
-            fhir_user: grant.fhir_user,
-            refreshed_at: now,
-        }
-    }
-
-    /// The set after a refresh grant: a new refresh token replaces the old one
-    /// only when the answer carries one.
-    pub fn renewed(mut self, response: TokenResponse, now: i64) -> TokenSet {
-        self.access_token = response.access_token;
-        self.expires_at = now + response.expires_in.unwrap_or(3600);
-        if let Some(rt) = response.refresh_token {
-            self.refresh_token = Some(rt);
-        }
-        if let Some(scope) = response.scope {
-            self.scope = scope;
-        }
-        self.refreshed_at = now;
-        self
-    }
-
-    pub fn access_expired(&self, now: i64) -> bool {
-        now + EXPIRY_MARGIN_SECS >= self.expires_at
-    }
-
-    /// When the refresh token lapses, by athenahealth's documented 90 days.
-    pub fn refresh_expires_at(&self) -> Option<i64> {
-        self.refresh_token
-            .as_ref()
-            .map(|_| self.refreshed_at + REFRESH_LIFETIME_SECS)
-    }
-
-    /// Whether a read can still succeed without a new sign-in.
-    pub fn usable(&self, now: i64) -> bool {
-        !self.access_expired(now) || self.refresh_expires_at().is_some_and(|at| at > now)
-    }
-
-    /// When a new sign-in will be needed.
-    pub fn signin_expires_at(&self) -> i64 {
-        self.refresh_expires_at().unwrap_or(self.expires_at)
-    }
-}
-
-/// What a code exchange was for: everything in a [`TokenSet`] that the
-/// token answer does not carry.
-pub struct Grant {
-    pub patient: String,
-    pub client_id: String,
-    pub fhir_base: String,
-    pub token_endpoint: String,
-    pub revocation_endpoint: Option<String>,
-    pub issuer: Option<String>,
-    pub fhir_user: Option<String>,
-}
-
-/// `<org>/<patient>`, the keychain account of one token set.
+/// `smart/<org>/<patient>`, the keychain account of one sign-in.
 pub fn key(org: &str, patient: &str) -> String {
-    format!("{org}/{patient}")
+    pk_med_smart::account(org, patient)
 }
 
-/// Where token sets live.
-pub trait TokenStore {
-    fn get(&self, key: &str) -> Result<Option<TokenSet>, CliError>;
-    fn set(&self, key: &str, tokens: &TokenSet) -> Result<(), CliError>;
-    fn delete(&self, key: &str) -> Result<bool, CliError>;
-}
+/// Where sessions live, shareable with the FHIR client's bearer source.
+pub type Store = Arc<dyn SessionStore + Send + Sync>;
 
 /// The OS keychain, service `piekstra.athena`.
-pub struct KeychainStore {
-    store: CredentialStore,
+pub fn keychain() -> Store {
+    let service = std::env::var(KEYCHAIN_SERVICE_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| KEYCHAIN_SERVICE.to_string());
+    Arc::new(CredentialStore::new(service))
 }
 
-impl KeychainStore {
-    pub fn new() -> Self {
-        let service = std::env::var(KEYCHAIN_SERVICE_ENV)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| KEYCHAIN_SERVICE.to_string());
-        KeychainStore {
-            store: CredentialStore::new(service),
-        }
-    }
+/// The stored session at `account`, or exit 3 naming the sign-in to redo.
+pub fn load(store: &dyn SessionStore, entry: &SessionEntry) -> Result<SmartSession, CliError> {
+    store.load(&entry.key())?.ok_or_else(|| {
+        CliError::Auth(format!(
+            "the keychain holds no sign-in for {} at {}",
+            entry.patient, entry.org
+        ))
+        .because(Reason::NoCredential)
+        .with_remedy(sign_in_again(&entry.org))
+    })
 }
 
-impl Default for KeychainStore {
-    fn default() -> Self {
-        Self::new()
-    }
+/// The remedy of a refused or missing sign-in.
+pub fn sign_in_again(org: &str) -> String {
+    format!("sign in again with `athena auth login --org {org}`")
 }
 
-impl TokenStore for KeychainStore {
-    fn get(&self, key: &str) -> Result<Option<TokenSet>, CliError> {
-        self.store.get_json(key).map_err(|e| {
-            if e.is_auth() {
-                e
-            } else {
-                e.because(Reason::CredentialUnreadable)
-            }
-        })
-    }
-
-    fn set(&self, key: &str, tokens: &TokenSet) -> Result<(), CliError> {
-        self.store.set_json(key, tokens)
-    }
-
-    fn delete(&self, key: &str) -> Result<bool, CliError> {
-        self.store.delete(key)
-    }
+/// When the refresh token lapses, by athenahealth's documented 90 days from
+/// the last grant (`tokens.obtained_at`).
+pub fn refresh_expires_at(session: &SmartSession) -> Option<u64> {
+    session
+        .tokens
+        .refresh_token
+        .as_ref()
+        .map(|_| session.tokens.obtained_at + REFRESH_LIFETIME_SECS)
 }
 
-/// Token sets in memory, for tests.
+/// Whether a read can still succeed without a new sign-in: not refused, and
+/// an access token in date or a refresh token that is.
+pub fn usable(session: &SmartSession, now: u64) -> bool {
+    session.refused_at.is_none()
+        && (!session.tokens.is_expired(now, DEFAULT_SKEW_SECS)
+            || refresh_expires_at(session).is_some_and(|at| at > now))
+}
+
+/// When a new sign-in will be needed (Unix seconds): when athenahealth
+/// refused the last grant, else the refresh token's 90 days, else the access
+/// token's hour.
+pub fn signin_expires_at(session: &SmartSession) -> u64 {
+    session.refused_at.unwrap_or_else(|| {
+        refresh_expires_at(session)
+            .or(session.tokens.expires_at)
+            .unwrap_or(session.tokens.obtained_at)
+    })
+}
+
+/// The revocation endpoint discovered at sign-in, if athenahealth named one.
+pub fn revocation_endpoint(session: &SmartSession) -> Option<&str> {
+    session
+        .extra
+        .get(REVOCATION_ENDPOINT)
+        .and_then(Value::as_str)
+}
+
+/// Sessions in memory, for tests: nothing touches the keychain. Unlike
+/// `pk_med_smart::MemoryStore` it can be shared with the FHIR client's bearer
+/// source, which must be `Send + Sync`.
 #[derive(Default)]
 pub struct MemoryStore {
-    items: RefCell<BTreeMap<String, TokenSet>>,
+    items: Mutex<HashMap<String, SmartSession>>,
 }
 
-impl TokenStore for MemoryStore {
-    fn get(&self, key: &str) -> Result<Option<TokenSet>, CliError> {
-        Ok(self.items.borrow().get(key).cloned())
+impl SessionStore for MemoryStore {
+    fn load(&self, account: &str) -> Result<Option<SmartSession>, CliError> {
+        Ok(self.items.lock().expect("the store").get(account).cloned())
     }
-
-    fn set(&self, key: &str, tokens: &TokenSet) -> Result<(), CliError> {
-        self.items.borrow_mut().insert(key.into(), tokens.clone());
+    fn save(&self, session: &SmartSession) -> Result<(), CliError> {
+        self.items
+            .lock()
+            .expect("the store")
+            .insert(session.account(), session.clone());
         Ok(())
     }
-
-    fn delete(&self, key: &str) -> Result<bool, CliError> {
-        Ok(self.items.borrow_mut().remove(key).is_some())
+    fn delete(&self, account: &str) -> Result<bool, CliError> {
+        Ok(self
+            .items
+            .lock()
+            .expect("the store")
+            .remove(account)
+            .is_some())
     }
 }
 
@@ -235,6 +153,7 @@ pub struct SessionEntry {
 }
 
 impl SessionEntry {
+    /// The keychain account of this sign-in.
     pub fn key(&self) -> String {
         key(&self.org, &self.patient)
     }
@@ -354,6 +273,39 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
         .map_err(|e| CliError::Other(format!("replacing {}: {e}", path.display())))
 }
 
+/// A synthetic session, for tests in this crate.
+#[cfg(test)]
+pub(crate) fn test_session(
+    org: &str,
+    patient: &str,
+    revocation: Option<&str>,
+    now: u64,
+) -> SmartSession {
+    let mut extra = serde_json::Map::new();
+    if let Some(endpoint) = revocation {
+        extra.insert(REVOCATION_ENDPOINT.into(), endpoint.into());
+    }
+    serde_json::from_value(serde_json::json!({
+        "format": 1,
+        "organization": org,
+        "patient": patient,
+        "fhir_base": "http://127.0.0.1:9/fhir/r4",
+        "token_endpoint": "http://127.0.0.1:9/oauth2/v1/token",
+        "client_id": "client",
+        "scope": "openid",
+        "tokens": {
+            "access_token": "access-1",
+            "token_type": "Bearer",
+            "refresh_token": null,
+            "expires_at": now + 3600,
+            "scope": "openid",
+            "obtained_at": now,
+        },
+        "extra": extra,
+    }))
+    .expect("a synthetic session")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,23 +320,6 @@ mod tests {
             fhir_base: "https://example.invalid/fhir/r4".into(),
             stored_at: "2026-01-01T00:00:00Z".into(),
             signin_expires_at: None,
-        }
-    }
-
-    fn tokens(refresh: Option<&str>, now: i64) -> TokenSet {
-        TokenSet {
-            access_token: "access-1".into(),
-            refresh_token: refresh.map(Into::into),
-            expires_at: now + 3600,
-            scope: "openid".into(),
-            patient: "a-1.E-1".into(),
-            client_id: "client".into(),
-            fhir_base: "https://example.invalid/fhir/r4".into(),
-            token_endpoint: "https://example.invalid/token".into(),
-            revocation_endpoint: None,
-            issuer: None,
-            fhir_user: None,
-            refreshed_at: now,
         }
     }
 
@@ -430,42 +365,50 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_keeps_the_old_refresh_token_when_none_comes_back() {
+    fn usability_follows_the_refresh_token_and_a_refusal() {
         let now = 1_000_000;
-        let set = tokens(Some("refresh-1"), now);
-        let renewed = set.renewed(
-            TokenResponse {
-                access_token: "access-2".into(),
-                expires_in: Some(300),
-                refresh_token: None,
-                scope: None,
-                id_token: None,
-                patient: None,
-            },
-            now + 10,
+        let mut s = test_session("clinic", "a-1.E-1", None, now);
+        s.tokens.expires_at = Some(now - 1);
+        assert!(!usable(&s, now));
+        assert_eq!(signin_expires_at(&s), now - 1);
+        s.tokens.refresh_token = Some("r".into());
+        assert!(usable(&s, now));
+        assert!(!usable(&s, now + REFRESH_LIFETIME_SECS + 1));
+        assert_eq!(signin_expires_at(&s), now + REFRESH_LIFETIME_SECS);
+        s.refused_at = Some(now + 5);
+        assert!(!usable(&s, now));
+        assert_eq!(signin_expires_at(&s), now + 5);
+    }
+
+    #[test]
+    fn the_account_is_pk_med_smarts() {
+        let s = test_session("clinic", "a-1.E-1", None, 0);
+        assert_eq!(s.account(), "smart/clinic/a-1.E-1");
+        assert_eq!(entry("clinic", "a-1.E-1", None).key(), s.account());
+        let store = MemoryStore::default();
+        store.save(&s).unwrap();
+        assert!(store.load("smart/clinic/a-1.E-1").unwrap().is_some());
+        assert!(store.delete("smart/clinic/a-1.E-1").unwrap());
+    }
+
+    #[test]
+    fn the_revocation_endpoint_rides_in_extra() {
+        let s = test_session(
+            "clinic",
+            "a-1.E-1",
+            Some("https://example.invalid/revoke"),
+            0,
         );
-        assert_eq!(renewed.refresh_token.as_deref(), Some("refresh-1"));
-        assert_eq!(renewed.expires_at, now + 310);
-        assert_eq!(renewed.refreshed_at, now + 10);
-        assert_eq!(renewed.scope, "openid");
-    }
-
-    #[test]
-    fn usability_follows_the_refresh_token() {
-        let now = 1_000_000;
-        let mut set = tokens(None, now);
-        set.expires_at = now - 1;
-        assert!(!set.usable(now));
-        set.refresh_token = Some("r".into());
-        assert!(set.usable(now));
-        assert!(!set.usable(now + REFRESH_LIFETIME_SECS + 1));
-    }
-
-    #[test]
-    fn debug_never_prints_a_token() {
-        let text = format!("{:?}", tokens(Some("refresh-secret"), 0));
-        assert!(!text.contains("access-1"));
-        assert!(!text.contains("refresh-secret"));
+        assert_eq!(
+            revocation_endpoint(&s),
+            Some("https://example.invalid/revoke")
+        );
+        let text = serde_json::to_string(&s).unwrap();
+        let back: SmartSession = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            revocation_endpoint(&back),
+            Some("https://example.invalid/revoke")
+        );
     }
 
     #[test]

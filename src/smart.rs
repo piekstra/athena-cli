@@ -1,74 +1,26 @@
-//! SMART App Launch for a standalone patient app: discovery and scopes.
+//! SMART App Launch for a standalone patient app, as athenahealth serves it:
+//! the vendor's quirks, the scopes athena asks for, and what a granted scope
+//! allows. Discovery, the launch and renewal are `pk_med_smart`'s.
 
 use std::collections::BTreeSet;
 
-use pk_cli_core::transport::require_secure_url;
-use pk_cli_core::CliError;
-use serde::Deserialize;
+use pk_med_smart::{ScopeSet, ScopeVersion, VendorQuirks};
 
-use crate::http::{request, Http};
-
-/// `.well-known/smart-configuration`, the fields athena uses.
+/// athenahealth needs nothing beyond what `pk_med_smart` does by default:
+/// `aud` on the authorization (it picks the practice, `docs/api.md`), a
+/// `nonce` whenever `openid` is asked for ("Required if requesting the openid
+/// scope"), and the granted scope on every refresh ("Required if grant_type
+/// is ... refresh_token"). Its `.well-known/smart-configuration` answers
+/// first, so `/metadata` is never asked.
 ///
-/// athenahealth's `issuer` is its Okta authorization server
+/// Its `issuer` is its Okta authorization server
 /// (`https://athena.okta.com/oauth2/...`), not the FHIR host, and its
 /// `grant_types_supported` leaves out `refresh_token` although refresh works;
-/// neither is relied on beyond what is noted here.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SmartConfiguration {
-    #[serde(default)]
-    pub issuer: Option<String>,
-    pub authorization_endpoint: String,
-    pub token_endpoint: String,
-    #[serde(default)]
-    pub revocation_endpoint: Option<String>,
-    #[serde(default)]
-    pub code_challenge_methods_supported: Vec<String>,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-}
+/// neither is relied on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Athenahealth;
 
-/// Read a FHIR server's SMART configuration.
-pub fn discover(http: &dyn Http, fhir_base: &str) -> Result<SmartConfiguration, CliError> {
-    let url = format!(
-        "{}/.well-known/smart-configuration",
-        fhir_base.trim_end_matches('/')
-    );
-    let response = http.call(request("GET", &url).header("Accept", "application/json"))?;
-    if !response.is_success() {
-        return Err(CliError::Upstream(format!(
-            "the FHIR server's SMART configuration answered HTTP {}",
-            response.status
-        )));
-    }
-    let config: SmartConfiguration = serde_json::from_str(&response.body).map_err(|e| {
-        CliError::Upstream(format!(
-            "the FHIR server's SMART configuration is not readable: {e}"
-        ))
-    })?;
-    for endpoint in std::iter::once(&config.authorization_endpoint)
-        .chain(std::iter::once(&config.token_endpoint))
-        .chain(config.revocation_endpoint.iter())
-    {
-        require_secure_url(endpoint).map_err(|_| {
-            CliError::Upstream(
-                "the FHIR server's SMART configuration names an endpoint that is not https".into(),
-            )
-        })?;
-    }
-    if !config.code_challenge_methods_supported.is_empty()
-        && !config
-            .code_challenge_methods_supported
-            .iter()
-            .any(|m| m == "S256")
-    {
-        return Err(CliError::Upstream(
-            "the FHIR server does not support PKCE S256, which a client without a secret needs"
-                .into(),
-        ));
-    }
-    Ok(config)
-}
+impl VendorQuirks for Athenahealth {}
 
 /// The resource types athena asks to read: athenahealth's list of
 /// auto-approved patient scopes for a standalone launch, less the DSTU2-only
@@ -103,17 +55,11 @@ pub const PATIENT_TYPES: &[&str] = &[
     "Specimen",
 ];
 
-/// The scope string of a standalone patient sign-in: OpenID Connect, a
-/// refresh token, the patient picker, and read access per type.
-pub fn scope_string() -> String {
-    let mut scopes = vec![
-        "openid".to_string(),
-        "fhirUser".into(),
-        "offline_access".into(),
-        "launch/patient".into(),
-    ];
-    scopes.extend(PATIENT_TYPES.iter().map(|t| format!("patient/{t}.read")));
-    scopes.join(" ")
+/// The scopes of a standalone patient sign-in: OpenID Connect, the patient
+/// picker, a refresh token, and read access per type in SMART v1 spelling
+/// (`patient/<Type>.read`), the one athenahealth's auto-approved list uses.
+pub fn scopes() -> ScopeSet {
+    ScopeSet::standalone_patient().read_types(ScopeVersion::V1, PATIENT_TYPES)
 }
 
 /// The resource types a granted scope string allows reading, in SMART v1
@@ -168,8 +114,8 @@ mod tests {
 
     #[test]
     fn the_scope_names_every_type_and_no_wildcard() {
-        let scope = scope_string();
-        assert!(scope.starts_with("openid fhirUser offline_access launch/patient "));
+        let scope = scopes().to_string();
+        assert!(scope.starts_with("openid fhirUser launch/patient offline_access "));
         assert!(scope.contains("patient/DocumentReference.read"));
         assert!(scope.contains("patient/Binary.read"));
         assert!(!scope.contains('*'));
