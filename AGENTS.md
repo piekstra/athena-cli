@@ -26,18 +26,18 @@ from [cli-common](https://github.com/piekstra/cli-common).
 | `tests/support/mock.rs` | a mock athenahealth practice on 127.0.0.1 (also `make mock`) |
 | `docs/api.md` | athenahealth's behaviour and traps, quoted; read before changing sign-in or export |
 
-medical-common is pinned at v0.1.0, on the same cli-common tag. From
-`pk-med-records`: the stream writer, its header, skip and trailer, the
+medical-common is pinned at v0.2.0, on the same cli-common tag (v0.31.1).
+From `pk-med-records`: the stream writer, its header, skip and trailer, the
 `Organization` and `PatientContext` DTOs, `records-export/v1` and the export
-file. From `pk-med-fhir`: `RawResource` and `outcome::status_error`. Tests
+file (`ExportFile`, committed after the trailer). From `pk-med-fhir`: `RawResource` and `outcome::status_error`. Tests
 read athena's stream back with `pk-med-records`' `RecordsReader`, as medrec
 does.
 
 `src/fhir.rs` keeps athena's own read client. `pk_med_fhir::FhirClient`
 takes a fixed bearer token; athena renews mid-export under the refresh lock,
 writes a refused sign-in back to the Keychain, and stops on the circuit
-breaker. `src/smart.rs` stands in for `pk-med-smart` until medical-common
-v0.2.0 is tagged and pinned.
+breaker. `src/smart.rs`, `src/oauth.rs` and `src/session.rs` stand in for
+`pk-med-smart` until athena's sign-in moves onto it.
 
 ## Medical data
 

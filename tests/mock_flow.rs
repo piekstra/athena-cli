@@ -354,6 +354,7 @@ fn failing_searches_trip_the_breaker() {
     let err = result.expect_err("the breaker trips");
     assert_eq!(err.exit_code(), 5);
     assert!(err.to_string().contains("in a row"), "{err}");
+    assert!(err.to_string().ends_with("— try again later"), "{err}");
     let out = lines(&text);
     let trailer = out.last().unwrap();
     assert_eq!(trailer["complete"], false);
@@ -543,7 +544,7 @@ fn a_search_entry_that_does_not_read_is_a_skip_and_the_rest_is_kept() {
 }
 
 #[test]
-fn an_export_to_a_directory_replaces_records_ndjson_and_reports_records_export() {
+fn an_export_to_a_directory_commits_complete_streams_and_keeps_the_last_one() {
     use pk_med_records::stream::{Item, RecordsReader, StreamError};
     let m = Mock::start(0);
     let http = BlockingTransport::new().unwrap();
@@ -590,7 +591,8 @@ fn an_export_to_a_directory_replaces_records_ndjson_and_reports_records_export()
         .collect();
     assert_eq!(names, vec!["records.ndjson".to_string()]);
 
-    // A pull cut short replaces the file with its partial stream, and says so.
+    // A pull cut short goes to records.incomplete.ndjson, and the last
+    // complete export stays.
     m.set_mode("degraded");
     let (export, error) = export::write_dir(&dir, &header(&tokens), now, |w| {
         export::export(&mut c, w, None)
@@ -598,6 +600,11 @@ fn an_export_to_a_directory_replaces_records_ndjson_and_reports_records_export()
     .unwrap();
     assert_eq!(error.expect("cut short").exit_code(), 5);
     assert!(!export.complete);
+    assert!(
+        export.path.ends_with("/records.incomplete.ndjson"),
+        "{}",
+        export.path
+    );
     assert!(export.bytes < sizes[0]);
     let file = std::fs::File::open(&export.path).unwrap();
     let mut reader = RecordsReader::new(std::io::BufReader::new(file));
@@ -607,5 +614,24 @@ fn an_export_to_a_directory_replaces_records_ndjson_and_reports_records_export()
         matches!(last, Err(StreamError::Incomplete { .. })),
         "{last:?}"
     );
+    assert_eq!(
+        std::fs::metadata(dir.join("records.ndjson")).unwrap().len(),
+        sizes[0]
+    );
+
+    // The next complete export replaces records.ndjson and clears the
+    // incomplete one.
+    m.set_mode("normal");
+    let (export, error) = export::write_dir(&dir, &header(&tokens), now, |w| {
+        export::export(&mut c, w, None)
+    })
+    .unwrap();
+    assert!(error.is_none() && export.complete);
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["records.ndjson".to_string()]);
     let _ = std::fs::remove_dir_all(&dir);
 }

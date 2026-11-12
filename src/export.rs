@@ -2,7 +2,6 @@
 //! `records-stream/v1` stream.
 
 use std::collections::BTreeSet;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -15,6 +14,7 @@ use crate::http::same_origin;
 use crate::smart::{granted_types, PATIENT_TYPES};
 use pk_med_fhir::RawResource;
 use pk_med_records::dto::RecordsExport;
+use pk_med_records::export::ExportFile;
 
 use crate::stream::{code, Finished, Header, Skip, Writer};
 
@@ -68,29 +68,29 @@ pub fn write_stream<W: Write>(
     Ok((finished, error))
 }
 
-/// `records export -o <DIR>`: the stream to `<DIR>/records.ndjson`
-/// (`pk_med_records::export::create_export_file`: owner-only, replacing the
-/// file of an earlier run) and its `records-export/v1` summary. A pull cut
-/// short still leaves its stream, marked `complete: false`, and returns its
-/// error beside the summary. A stream whose header or trailer could not be
-/// written is removed.
+/// The stream writer of `records export -o <DIR>`.
+pub type DirWriter<'f> = Writer<BufWriter<&'f mut ExportFile>>;
+
+/// `records export -o <DIR>` (medical-common DESIGN 1.5): the stream is
+/// written beside `<DIR>/records.ndjson`, owner-only, and committed when the
+/// trailer is out. A complete stream replaces `records.ndjson`; one cut short
+/// goes to `records.incomplete.ndjson` and the last complete export stays.
+/// Returns the `records-export/v1` summary of the file committed and the
+/// error that cut the pull short. A stream whose header or trailer could not
+/// be written is never committed, and its file is removed.
 pub fn write_dir(
     dir: &Path,
     header: &Header,
     finished_at: impl FnOnce() -> String,
-    pull: impl FnOnce(&mut Writer<BufWriter<File>>) -> Result<(), CliError>,
+    pull: impl FnOnce(&mut DirWriter<'_>) -> Result<(), CliError>,
 ) -> Result<(RecordsExport, Option<CliError>), CliError> {
-    let (path, file) = pk_med_records::export::create_export_file(dir)?;
-    match write_stream(BufWriter::new(file), header, finished_at, pull) {
-        Ok((finished, error)) => Ok((
-            RecordsExport::new(path.display().to_string(), &finished),
-            error,
-        )),
-        Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            Err(e)
-        }
-    }
+    let mut file = pk_med_records::export::create_export_file(dir)?;
+    let (finished, error) = write_stream(BufWriter::new(&mut file), header, finished_at, pull)?;
+    let path = file.commit(&finished)?;
+    Ok((
+        RecordsExport::new(path.display().to_string(), &finished),
+        error,
+    ))
 }
 
 /// Export the client's patient to `w`, whose header is already written.
@@ -316,7 +316,8 @@ fn skip_or_fail<W: Write>(
                 "{} requests in a row failed, so the export stopped: {}",
                 fhir::BREAKER,
                 error.message()
-            )))
+            ))
+            .with_remedy(pk_med_fhir::outcome::TRY_AGAIN))
         }
         (CliError::Upstream(_), _) => code::UPSTREAM,
         _ => return Err(error),

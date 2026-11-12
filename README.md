@@ -64,10 +64,12 @@ or refused, 4 not found, 5 the practice or network failed.
 
 `records export -o <DIR>` writes `<DIR>/records.ndjson` instead and prints
 `records-export/v1`, for athenahealth's sandbox and local test servers only.
-The file is owner-only and replaced on each run, a failed run included: a
-pull cut short leaves its partial stream there, marked `complete: false`,
-and exits with its error's code. Up to v0.1.0, `-o` wrote a new
-`<profile>_<patient>_<time>.ndjson` on each run.
+The file is owner-only and written beside `records.ndjson` until the
+trailer is out. A complete pull replaces `records.ndjson`. A pull cut short
+goes to `records.incomplete.ndjson` (`complete: false`), keeps the last
+complete export, and exits with its error's code. v0.1.0 wrote a new
+`<profile>_<patient>_<time>.ndjson` on each run, and v0.2.0 replaced
+`records.ndjson` even when a run failed.
 
 ## How sign-in works
 
