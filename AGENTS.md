@@ -20,15 +20,24 @@ from [cli-common](https://github.com/piekstra/cli-common).
 | `src/session.rs` | the token set, one Keychain item per (practice profile, patient) behind `TokenStore`, and the session index (`sessions.json`) |
 | `src/fhir.rs` | the read client: renewal under the refresh lock, retries, same-origin paging, status to error |
 | `src/export.rs` | the export plan: searches, referenced reads, `Binary` after its parent, skips |
-| `src/stream.rs` | the `records-stream/v1` writer |
+| `src/stream.rs` | `pk-med-records`' `records-stream/v1` writer and DTOs, re-exported, and athena's header |
 | `src/documents.rs` | `documents/v1` over DocumentReference and DiagnosticReport, `Binary` fetch and file-type check |
 | `src/http.rs` | the transport trait, origins |
 | `tests/support/mock.rs` | a mock athenahealth practice on 127.0.0.1 (also `make mock`) |
 | `docs/api.md` | athenahealth's behaviour and traps, quoted; read before changing sign-in or export |
 
-`src/smart.rs`, `src/fhir.rs` and `src/stream.rs` stand in for
-medical-common's `pk-med-smart`, `pk-med-fhir` and `pk-med-records`; each
-goes when its crate is tagged and pinned, with no change to the stream.
+medical-common is pinned at v0.1.0, on the same cli-common tag. From
+`pk-med-records`: the stream writer, its header, skip and trailer, the
+`Organization` and `PatientContext` DTOs, `records-export/v1` and the export
+file. From `pk-med-fhir`: `RawResource` and `outcome::status_error`. Tests
+read athena's stream back with `pk-med-records`' `RecordsReader`, as medrec
+does.
+
+`src/fhir.rs` keeps athena's own read client. `pk_med_fhir::FhirClient`
+takes a fixed bearer token; athena renews mid-export under the refresh lock,
+writes a refused sign-in back to the Keychain, and stops on the circuit
+breaker. `src/smart.rs` stands in for `pk-med-smart` until medical-common
+v0.2.0 is tagged and pinned.
 
 ## Medical data
 
@@ -43,7 +52,7 @@ Medical records are the most sensitive data a household has.
   and exit codes only, or is left to the owner in their own terminal. An
   agent never reads, prints or summarizes a real record, document or patient
   name.
-- `records export -o <DIR>` writes a plain file and refuses any server but
+- `records export -o <DIR>` writes `<DIR>/records.ndjson` and refuses any server but
   athenahealth's sandbox and 127.0.0.1 (`cli::synthetic`); real records go to
   medrec through `--ndjson`.
 - No MCP surface: athena is not registered in cli-mcp and ships no `mcp`

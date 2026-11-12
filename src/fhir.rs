@@ -8,7 +8,6 @@ use pk_cli_core::transport::HttpResponse;
 use pk_cli_core::{CliError, Reason};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use serde_json::Value;
 
 use crate::http::{request, same_origin, Http};
 use crate::oauth;
@@ -73,6 +72,11 @@ impl<'a> Client<'a> {
 
     pub fn base(&self) -> &str {
         &self.tokens.fhir_base
+    }
+
+    /// The practice profile this sign-in belongs to.
+    pub fn org(&self) -> &str {
+        self.key.split('/').next().unwrap_or_default()
     }
 
     pub fn patient(&self) -> &str {
@@ -168,9 +172,10 @@ impl<'a> Client<'a> {
     /// [`check`], with a refused token's remedy naming this sign-in's
     /// practice profile.
     pub fn check(&self, response: &HttpResponse, what: &str) -> Result<(), CliError> {
-        check(response, what).map_err(|e| {
+        let origin = crate::http::origin(self.base()).unwrap_or_else(|| self.base().to_string());
+        check(response, what, &origin, (self.now)()).map_err(|e| {
             if e.reason() == Some(Reason::CredentialRefused) {
-                let org = self.key.split('/').next().unwrap_or_default();
+                let org = self.org();
                 e.with_remedy(format!(
                     "sign in again with `athena auth login --org {org}`"
                 ))
@@ -388,106 +393,58 @@ struct EntrySearch {
     mode: Option<String>,
 }
 
-/// Map a FHIR answer onto the exit-code contract. The message names the
-/// request and the `OperationOutcome`'s issue code, never its content beyond
-/// a short diagnostic.
-pub fn check(response: &HttpResponse, what: &str) -> Result<(), CliError> {
+/// Map a FHIR answer onto the exit-code contract with medical-common's
+/// `status_error`: by the OperationOutcome's issue code when it has one the
+/// contract knows, otherwise by the HTTP status. A 429, a 5xx or an HTML 403
+/// (athenahealth's edge, not the FHIR server) is Upstream with no reason.
+/// `origin` names the server in the message; `now` is Unix seconds.
+pub fn check(response: &HttpResponse, what: &str, origin: &str, now: i64) -> Result<(), CliError> {
     if response.is_success() {
         return Ok(());
     }
-    let status = response.status;
-    let outcome = outcome_summary(&response.body);
-    let detail = if outcome.is_empty() {
-        String::new()
-    } else {
-        format!(": {outcome}")
-    };
-    Err(match status {
-        401 => CliError::Auth(format!(
-            "athenahealth refused the token for {what} (HTTP 401){detail}"
-        ))
-        .because(Reason::CredentialRefused)
-        .with_remedy("sign in again with `athena auth login --org <ORG>`"),
-        403 => CliError::Auth(format!(
-            "{what} is not allowed for this sign-in (HTTP 403){detail}"
-        ))
-        .because(Reason::Forbidden),
-        404 | 410 => CliError::NotFound(format!("{what} was not found (HTTP {status}){detail}")),
-        400 | 422 => CliError::Upstream(format!(
-            "athenahealth refused the request for {what} (HTTP {status}){detail}"
-        ))
-        .because(Reason::BadRequest),
-        _ => CliError::Upstream(format!(
-            "athenahealth answered HTTP {status} for {what}{detail}"
-        )),
-    })
-}
-
-/// `issue[0].code` and up to 160 characters of its diagnostics.
-fn outcome_summary(body: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return String::new();
-    };
-    if value.get("resourceType").and_then(Value::as_str) != Some("OperationOutcome") {
-        return String::new();
-    }
-    let issue = &value["issue"][0];
-    let code = issue["code"].as_str().unwrap_or("");
-    let text = issue["diagnostics"]
-        .as_str()
-        .or_else(|| issue["details"]["text"].as_str())
-        .unwrap_or("");
-    let text: String = text.chars().filter(|c| !c.is_control()).take(160).collect();
-    match (code.is_empty(), text.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => code.to_string(),
-        (true, false) => text,
-        (false, false) => format!("{code}: {text}"),
-    }
-}
-
-/// `resourceType` and `id` of a resource's JSON text.
-pub fn identity(raw: &RawValue) -> Option<(String, String)> {
-    #[derive(Deserialize)]
-    struct Head {
-        #[serde(rename = "resourceType")]
-        resource_type: String,
-        #[serde(default)]
-        id: Option<String>,
-    }
-    let head: Head = serde_json::from_str(raw.get()).ok()?;
-    Some((head.resource_type, head.id.unwrap_or_default()))
+    Err(pk_med_fhir::outcome::status_error(
+        what, origin, response, now,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const ORIGIN: &str = "https://api.preview.platform.athenahealth.com";
+
     #[test]
     fn statuses_map_to_exit_codes() {
         let outcome = r#"{"resourceType":"OperationOutcome","issue":[{"code":"forbidden","diagnostics":"scope missing"}]}"#;
-        let forbidden = check(&HttpResponse::new(403, outcome), "Observation").unwrap_err();
+        let forbidden =
+            check(&HttpResponse::new(403, outcome), "Observation", ORIGIN, 0).unwrap_err();
         assert_eq!(forbidden.exit_code(), 3);
         assert_eq!(forbidden.reason(), Some(Reason::Forbidden));
         assert!(forbidden.message().contains("forbidden: scope missing"));
         assert_eq!(
-            check(&HttpResponse::new(404, ""), "x")
+            check(&HttpResponse::new(404, ""), "x", ORIGIN, 0)
                 .unwrap_err()
                 .exit_code(),
             4
         );
-        let bad = check(&HttpResponse::new(400, ""), "x").unwrap_err();
+        let bad = check(&HttpResponse::new(400, ""), "x", ORIGIN, 0).unwrap_err();
         assert_eq!(
             (bad.exit_code(), bad.reason()),
             (5, Some(Reason::BadRequest))
         );
         assert_eq!(
-            check(&HttpResponse::new(500, "boom"), "x")
+            check(&HttpResponse::new(500, "boom"), "x", ORIGIN, 0)
                 .unwrap_err()
                 .exit_code(),
             5
         );
-        assert!(check(&HttpResponse::new(200, "{}"), "x").is_ok());
+        assert!(check(&HttpResponse::new(200, "{}"), "x", ORIGIN, 0).is_ok());
+        let throttled = check(&HttpResponse::new(429, ""), "x", ORIGIN, 0).unwrap_err();
+        assert_eq!((throttled.exit_code(), throttled.reason()), (5, None));
+        let edge = HttpResponse::new(403, "<html>blocked</html>")
+            .header("content-type", "text/html; charset=utf-8");
+        let edge = check(&edge, "x", ORIGIN, 0).unwrap_err();
+        assert_eq!((edge.exit_code(), edge.reason()), (5, None));
     }
 
     #[test]
@@ -500,13 +457,5 @@ mod tests {
                 "{attempt}: {wait:?}"
             );
         }
-    }
-
-    #[test]
-    fn identity_reads_type_and_id() {
-        let raw: Box<RawValue> =
-            serde_json::from_str(r#"{"resourceType":"Observation","id":"o-1","value":1.50}"#)
-                .unwrap();
-        assert_eq!(identity(&raw), Some(("Observation".into(), "o-1".into())));
     }
 }

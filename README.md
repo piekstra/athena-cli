@@ -62,7 +62,8 @@ Release assets: `athena-<target>.tar.gz` and `.sha256` for
 Every command takes `--json`. Exit codes: 0 ok, 2 usage, 3 sign-in needed
 or refused, 4 not found, 5 the practice or network failed.
 
-`records export -o <DIR>` writes a plain file instead, for athenahealth's
+`records export -o <DIR>` writes `<DIR>/records.ndjson` instead (owner-only,
+replaced on each run) and prints `records-export/v1`, for athenahealth's
 sandbox and local test servers only.
 
 ## How sign-in works

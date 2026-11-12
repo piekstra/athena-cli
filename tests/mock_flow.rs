@@ -15,7 +15,7 @@ use athena::fhir::Client;
 use athena::login;
 use athena::session::{key, MemoryStore, TokenSet, TokenStore};
 use athena::stream::{self, Writer};
-use pk_cli_core::RangeArgs;
+use pk_cli_core::{CliError, RangeArgs};
 use pk_cli_http::BlockingTransport;
 use serde_json::Value;
 use support::mock::{self, Mock};
@@ -70,29 +70,45 @@ fn client<'a>(
 }
 
 fn header(tokens: &TokenSet) -> stream::Header {
-    stream::Header::new(
+    stream::header(
         stream::Organization {
             id: "mock".into(),
             name: "Mock practice".into(),
             fhir_base: tokens.fhir_base.clone(),
-            vendor: "athenahealth",
+            vendor: Some(stream::VENDOR.into()),
+            location: None,
+            aliases: Vec::new(),
         },
-        stream::Patient {
+        stream::PatientContext {
             id: tokens.patient.clone(),
             organization: "mock".into(),
             label: Some("kid".into()),
             relationship: Some("proxy".into()),
-            kind: "patient",
+            kind: Some(stream::kind::PATIENT.into()),
+            member_role: None,
+            fhir_user: None,
+            name: None,
+            session: None,
         },
         None,
         "2026-01-01T00:00:00Z".into(),
     )
 }
 
-fn lines(bytes: Vec<u8>) -> Vec<Value> {
-    String::from_utf8(bytes)
-        .unwrap()
-        .lines()
+/// One export into memory, as `athena records export --ndjson` writes it:
+/// the stream's text, and the error that cut it short (recorded in the
+/// trailer as `complete: false`).
+fn pull(c: &mut Client<'_>, tokens: &TokenSet) -> (String, Result<(), CliError>) {
+    let mut buf = Vec::new();
+    let mut w = Writer::start(&mut buf, &header(tokens)).unwrap();
+    let result = export::export(c, &mut w, None);
+    w.finish("2026-01-01T00:00:01Z", result.as_ref().err())
+        .unwrap();
+    (String::from_utf8(buf).unwrap(), result)
+}
+
+fn lines(text: &str) -> Vec<Value> {
+    text.lines()
         .map(|l| serde_json::from_str(l).expect("every line is JSON"))
         .collect()
 }
@@ -117,10 +133,9 @@ fn the_export_streams_every_resource_with_binaries_after_their_parents() {
     let tokens = sign_in(&m, &http);
     let store = MemoryStore::default();
     let mut c = client(&http, &store, &tokens);
-    let mut w = Writer::new(Vec::new());
-    w.header(&header(&tokens)).unwrap();
-    export::export(&mut c, &mut w, None).expect("export");
-    let out = lines(w.finish("2026-01-01T00:00:01Z".into()).unwrap());
+    let (text, result) = pull(&mut c, &tokens);
+    result.expect("export");
+    let out = lines(&text);
 
     assert_eq!(out[0]["schema"], "records-stream/v1");
     let trailer = out.last().unwrap();
@@ -200,10 +215,9 @@ fn numbers_reach_the_stream_as_the_server_wrote_them() {
     let tokens = sign_in(&m, &http);
     let store = MemoryStore::default();
     let mut c = client(&http, &store, &tokens);
-    let mut w = Writer::new(Vec::new());
-    w.header(&header(&tokens)).unwrap();
-    export::export(&mut c, &mut w, None).unwrap();
-    let text = String::from_utf8(w.finish(String::new()).unwrap()).unwrap();
+    let (text, result) = pull(&mut c, &tokens);
+    result.unwrap();
+    let text = text.clone();
     let weight = text
         .lines()
         .find(|l| l.contains("\"id\":\"ob-1\""))
@@ -246,15 +260,14 @@ fn a_revoked_sign_in_ends_the_stream_incomplete_with_exit_3() {
     let mut c = client(&http, &store, &tokens);
     m.expire_access_tokens();
     m.set_mode("revoked");
-    let mut w = Writer::new(Vec::new());
-    w.header(&header(&tokens)).unwrap();
-    let err = export::export(&mut c, &mut w, None).unwrap_err();
+    let (text, result) = pull(&mut c, &tokens);
+    let err = result.unwrap_err();
     assert_eq!(err.exit_code(), 3);
     assert!(
         err.to_string().contains("athena auth login --org mock"),
         "{err}"
     );
-    let out = lines(w.fail(&err, String::new()).unwrap());
+    let out = lines(&text);
     let trailer = out.last().unwrap();
     assert_eq!(trailer["complete"], false);
     assert_eq!(trailer["error"]["code"], err.code());
@@ -276,11 +289,10 @@ fn a_server_that_is_down_fails_the_export_after_retries() {
     let mut c = client(&http, &store, &tokens);
     m.set_mode("down");
     let before = m.requests().len();
-    let mut w = Writer::new(Vec::new());
-    w.header(&header(&tokens)).unwrap();
-    let err = export::export(&mut c, &mut w, None).expect_err("no patient, no export");
+    let (text, result) = pull(&mut c, &tokens);
+    let err = result.expect_err("no patient, no export");
     assert_eq!(err.exit_code(), 5);
-    let out = lines(w.fail(&err, String::new()).unwrap());
+    let out = lines(&text);
     assert_eq!(out.len(), 2, "header and trailer only");
     assert_eq!(out[1]["complete"], false);
     assert_eq!(out[1]["error"]["exit_code"], 5);
@@ -300,12 +312,12 @@ fn a_refused_patient_read_ends_the_export_as_a_sign_in_problem() {
     let store = MemoryStore::default();
     let mut c = client(&http, &store, &tokens);
     m.set_mode("forbidden");
-    let mut w = Writer::new(Vec::new());
-    w.header(&header(&tokens)).unwrap();
-    let err = export::export(&mut c, &mut w, None).expect_err("refused");
+    let (text, result) = pull(&mut c, &tokens);
+    let err = result.expect_err("refused");
     assert_eq!(err.exit_code(), 3);
     assert!(err.to_string().contains("turned off access"), "{err}");
-    let out = lines(w.fail(&err, String::new()).unwrap());
+    assert!(err.to_string().contains("--org mock"), "{err}");
+    let out = lines(&text);
     assert_eq!(out.len(), 2);
     assert_eq!(out[1]["complete"], false);
 }
@@ -319,12 +331,11 @@ fn failing_searches_trip_the_breaker() {
     let mut c = client(&http, &store, &tokens);
     m.set_mode("degraded");
     let before = m.requests().len();
-    let mut w = Writer::new(Vec::new());
-    w.header(&header(&tokens)).unwrap();
-    let err = export::export(&mut c, &mut w, None).expect_err("the breaker trips");
+    let (text, result) = pull(&mut c, &tokens);
+    let err = result.expect_err("the breaker trips");
     assert_eq!(err.exit_code(), 5);
     assert!(err.to_string().contains("in a row"), "{err}");
-    let out = lines(w.fail(&err, String::new()).unwrap());
+    let out = lines(&text);
     let trailer = out.last().unwrap();
     assert_eq!(trailer["complete"], false);
     assert_eq!(trailer["counts"]["Patient"], 1);
@@ -421,4 +432,39 @@ fn a_token_goes_nowhere_but_its_own_server() {
         2
     );
     assert!(c.resolve(&format!("{}/Patient/x", m.fhir_base())).is_ok());
+}
+
+#[test]
+fn the_stream_reads_back_with_the_consumers_reader() {
+    use pk_med_records::stream::{Item, RecordsReader};
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let tokens = sign_in(&m, &http);
+    let store = MemoryStore::default();
+    let mut c = client(&http, &store, &tokens);
+    let (text, result) = pull(&mut c, &tokens);
+    result.expect("export");
+    let mut reader = RecordsReader::new(std::io::BufReader::new(text.as_bytes()));
+    assert_eq!(reader.header().unwrap().source.cli, "athena");
+    let mut resources = 0u64;
+    let mut trailer = None;
+    for item in reader {
+        match item.expect("every line reads") {
+            Item::Resource(_) => resources += 1,
+            Item::Trailer(t) => trailer = Some(t),
+        }
+    }
+    let trailer = trailer.expect("a trailer");
+    assert!(trailer.complete);
+    assert_eq!(trailer.total(), resources);
+    // records-stream/v1: a skipped search names no patient id.
+    let searches: Vec<&str> = trailer
+        .skipped
+        .iter()
+        .filter_map(|s| s.search.as_deref())
+        .collect();
+    assert!(searches.contains(&"ServiceRequest"), "{searches:?}");
+    for search in searches {
+        assert!(!search.contains(&tokens.patient), "{search}");
+    }
 }
