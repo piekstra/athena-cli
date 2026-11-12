@@ -75,7 +75,7 @@ and chart sharing group ID(s) for that organization." ([FHIR Base URLs][base])
 
 ## Sign-in: SMART standalone patient launch
 
-athena signs in through medical-common's `pk_med_smart` (v0.4.1):
+athena signs in through medical-common's `pk_med_smart` (v0.4.2):
 `discover` reads `.well-known/smart-configuration` (and checks that an https
 server names only https endpoints), `begin` binds the redirect listener and
 builds the authorize URL with PKCE S256, state, `aud` and a nonce, and
@@ -190,8 +190,9 @@ From the [Token Endpoint][token] page:
   provided to the authorize endpoint".
 
 A sign-in is one `pk_med_smart::SmartSession` in the Keychain, account
-`smart/<profile>/<patient>` (v0.2.x used `<profile>/<patient>`; such an item
-is no longer read). It keeps a refresh token until a token answer carries a
+`smart/<profile>/<patient>`. v0.2.x used `<profile>/<patient>`: such an item
+is no longer used for reads, and `auth logout` revokes its tokens and deletes
+it with the new one. It keeps a refresh token until a token answer carries a
 new one, and `tokens.obtained_at` is the last grant, so athena reports the
 90-day horizon as `signin_expires_at` from it. `pk_med_smart::Renewer` runs
 every renewal under the family's refresh lock (`pk_cli_auth::refresh_lock`),

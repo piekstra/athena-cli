@@ -15,12 +15,12 @@ use athena::env::Environment;
 use athena::export;
 use athena::fhir::{Client, Live};
 use athena::login;
-use athena::session::{self, key, MemoryStore};
+use athena::session::{self, key};
 use athena::stream;
 use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_core::{CliError, RangeArgs, Reason};
 use pk_cli_http::BlockingTransport;
-use pk_med_smart::{SessionStore, SmartSession};
+use pk_med_smart::{MemoryStore, SessionStore, SmartSession};
 use serde_json::Value;
 use support::mock::{self, Mock};
 
@@ -324,6 +324,25 @@ fn an_expired_token_is_renewed_once_with_the_granted_scope() {
         stored.tokens.access_token,
         "the client holds what the keychain holds"
     );
+}
+
+#[test]
+fn a_stored_sign_in_without_a_patient_is_refused_before_any_read() {
+    let m = Mock::start(0);
+    let http = BlockingTransport::new().unwrap();
+    let mut tokens = sign_in(&m, &http);
+    tokens.patient = None;
+    let store = Arc::new(MemoryStore::default());
+    store.save(&tokens).unwrap();
+    let before = m.requests().len();
+    let live = Live::start(store.clone(), lock(), http.clone(), tokens).unwrap();
+    let err = Client::new(http.clone(), live).err().expect("refused");
+    assert_eq!(err.exit_code(), 3);
+    assert!(
+        err.to_string().contains("athena auth login --org mock"),
+        "{err}"
+    );
+    assert_eq!(m.requests().len(), before, "nothing was sent");
 }
 
 #[test]

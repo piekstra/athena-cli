@@ -596,9 +596,10 @@ fn auth_status(ctx: &Ctx, select: &Select) -> Result<(), CliError> {
                     "refresh_token".into(),
                     json!(stored.tokens.refresh_token.is_some()),
                 );
-                if let Some(at) = stored.tokens.expires_at {
-                    row.insert("access_expires_at".into(), json!(rfc3339(at)));
-                }
+                row.insert(
+                    "access_expires_at".into(),
+                    json!(stored.tokens.expires_at.map(rfc3339)),
+                );
                 row.insert(
                     "signin_expires_at".into(),
                     json!(rfc3339(session::signin_expires_at(&stored))),
@@ -686,7 +687,19 @@ fn auth_logout(ctx: &Ctx, args: LogoutCmd) -> Result<(), CliError> {
         if let Ok(Some(stored)) = store.load(&key) {
             revoked = revoke_all(&http, &stored);
         }
-        let found = RefreshLock::forget_for_binary(BIN, || store.delete(&key))?;
+        let mut found = RefreshLock::forget_for_binary(BIN, || store.delete(&key))?;
+        // A sign-in v0.2.x stored at `<org>/<patient>`: nothing else reaches
+        // it, so it is revoked and removed here.
+        match session::load_legacy(&entry.org, &entry.patient) {
+            Ok(Some(legacy)) => {
+                if let Some(legacy) = &legacy {
+                    revoked |= revoke_legacy(&http, legacy);
+                }
+                found |= session::delete_legacy(&entry.org, &entry.patient)?;
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("warning: {}", e.message()),
+        }
         index.remove(&entry.org, &entry.patient);
         index.save(&sessions_path)?;
         out.push(json!({
@@ -741,6 +754,29 @@ fn revoke_all(http: &dyn crate::http::Http, stored: &SmartSession) -> bool {
     ) {
         eprintln!("warning: revoking the access token failed: {}", e.message());
         ok = false;
+    }
+    ok
+}
+
+/// [`revoke_all`] for a v0.2.x sign-in.
+fn revoke_legacy(http: &dyn crate::http::Http, legacy: &session::LegacySignIn) -> bool {
+    let Some(endpoint) = &legacy.revocation_endpoint else {
+        return false;
+    };
+    let mut ok = true;
+    let tokens = legacy
+        .refresh_token
+        .iter()
+        .map(|t| (t.as_str(), "refresh_token"))
+        .chain([(legacy.access_token.as_str(), "access_token")]);
+    for (token, hint) in tokens {
+        if let Err(e) = oauth::revoke(http, endpoint, &legacy.client_id, token, hint) {
+            eprintln!(
+                "warning: revoking the v0.2.x {hint} failed: {}",
+                e.message()
+            );
+            ok = false;
+        }
     }
     ok
 }

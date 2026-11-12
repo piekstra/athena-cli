@@ -3,7 +3,7 @@
 //! `pk_med_smart::Renewer`, and the circuit breaker a pull counts.
 
 use std::cell::Cell;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use pk_cli_auth::oauth::{ClientAuth, OAuthClient};
@@ -98,7 +98,14 @@ impl Live {
 
     /// The session as it stands, renewals included.
     pub fn session(&self) -> SmartSession {
-        self.current.lock().expect("the session").clone()
+        self.current().clone()
+    }
+
+    /// The lock is held only to read or replace the session whole, so a
+    /// panic elsewhere leaves nothing half-written: a poisoned lock is
+    /// taken as it stands.
+    fn current(&self) -> MutexGuard<'_, SmartSession> {
+        self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The bearer for the next request: the current token, renewed first
@@ -127,14 +134,14 @@ impl Live {
         match renewer.after_refusal(&self.account, &presented, at) {
             Ok(renewed) => {
                 let bearer = renewed.bearer();
-                *self.current.lock().expect("the session") = renewed;
+                *self.current() = renewed;
                 Ok(bearer)
             }
             Err(e) => {
                 // The renewer stamped the stored session the same way, so the
                 // index the caller writes follows the keychain.
                 if e.reason() == Some(Reason::CredentialRefused) {
-                    self.current.lock().expect("the session").refused_at = Some(at);
+                    self.current().refused_at = Some(at);
                 }
                 Err(remedied(&current.organization, e))
             }
@@ -155,8 +162,17 @@ pub struct Client {
 }
 
 impl Client {
+    /// A client over the live session, which must name its patient (every
+    /// athenahealth sign-in does, and `auth login` refuses one that does not).
     pub fn new(transport: BlockingTransport, live: Live) -> Result<Client, CliError> {
         let session = live.session();
+        let Some(patient) = session.patient.clone() else {
+            return Err(CliError::Auth(
+                "the stored sign-in names no patient, so there is nothing to read".into(),
+            )
+            .because(Reason::NoCredential)
+            .with_remedy(session::sign_in_again(&session.organization)));
+        };
         let source = live.clone();
         let fhir = FhirClient::new(transport, &session.fhir_base, BIN, VERSION)?
             .bearer_with(move |refused| source.bearer(refused))
@@ -166,7 +182,7 @@ impl Client {
             fhir,
             live,
             org: session.organization,
-            patient: session.patient.unwrap_or_default(),
+            patient,
             failures: Cell::new(0),
         })
     }

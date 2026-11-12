@@ -6,9 +6,9 @@
 //! list` and `--patient <label>` work without reading the keychain, which on
 //! macOS costs a permission prompt per item for each new build.
 
-use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pk_cli_auth::token::DEFAULT_SKEW_SECS;
 use pk_cli_core::{CliError, Reason};
@@ -40,13 +40,86 @@ pub fn key(org: &str, patient: &str) -> String {
 /// Where sessions live, shareable with the FHIR client's bearer source.
 pub type Store = Arc<dyn SessionStore + Send + Sync>;
 
-/// The OS keychain, service `piekstra.athena`.
-pub fn keychain() -> Store {
+fn credential_store() -> CredentialStore {
     let service = std::env::var(KEYCHAIN_SERVICE_ENV)
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| KEYCHAIN_SERVICE.to_string());
-    Arc::new(CredentialStore::new(service))
+    CredentialStore::new(service)
+}
+
+/// The OS keychain, service `piekstra.athena`.
+pub fn keychain() -> Store {
+    Arc::new(Keychain(credential_store()))
+}
+
+/// `pk_med_smart`'s keychain store, with a read that fails for any reason
+/// but a refused or missing credential tagged `CredentialUnreadable`, the
+/// code `auth status` has reported since v0.1.0.
+struct Keychain(CredentialStore);
+
+impl SessionStore for Keychain {
+    fn load(&self, account: &str) -> Result<Option<SmartSession>, CliError> {
+        self.0.load(account).map_err(|e| {
+            if e.is_auth() {
+                e
+            } else {
+                e.because(Reason::CredentialUnreadable)
+            }
+        })
+    }
+    fn save(&self, session: &SmartSession) -> Result<(), CliError> {
+        self.0.save(session)
+    }
+    fn delete(&self, account: &str) -> Result<bool, CliError> {
+        SessionStore::delete(&self.0, account)
+    }
+}
+
+/// What `auth logout` needs from a sign-in v0.2.x stored at account
+/// `<org>/<patient>` (its own token JSON), which nothing else reads since
+/// v0.3.0. `Debug` shows no token.
+#[derive(Deserialize)]
+pub struct LegacySignIn {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    pub client_id: String,
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+}
+
+impl fmt::Debug for LegacySignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LegacySignIn")
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The keychain account v0.2.x used.
+pub fn legacy_account(org: &str, patient: &str) -> String {
+    format!("{org}/{patient}")
+}
+
+/// Read a v0.2.x sign-in. `Ok(None)` when there is none; an item that does
+/// not read as one is `Some(None)`, to be removed without a revocation. The
+/// error names neither the account nor a value.
+pub fn load_legacy(org: &str, patient: &str) -> Result<Option<Option<LegacySignIn>>, CliError> {
+    let found = credential_store()
+        .get(&legacy_account(org, patient))
+        .map_err(|e| {
+            CliError::Keychain(format!(
+                "reading the v0.2.x sign-in at {org} failed ({})",
+                e.code()
+            ))
+        })?;
+    Ok(found.map(|text| serde_json::from_str(text.expose()).ok()))
+}
+
+/// Delete a v0.2.x sign-in; whether there was one.
+pub fn delete_legacy(org: &str, patient: &str) -> Result<bool, CliError> {
+    credential_store().delete(&legacy_account(org, patient))
 }
 
 /// The stored session at `account`, or exit 3 naming the sign-in to redo.
@@ -101,35 +174,6 @@ pub fn revocation_endpoint(session: &SmartSession) -> Option<&str> {
         .extra
         .get(REVOCATION_ENDPOINT)
         .and_then(Value::as_str)
-}
-
-/// Sessions in memory, for tests: nothing touches the keychain. Unlike
-/// `pk_med_smart::MemoryStore` it can be shared with the FHIR client's bearer
-/// source, which must be `Send + Sync`.
-#[derive(Default)]
-pub struct MemoryStore {
-    items: Mutex<HashMap<String, SmartSession>>,
-}
-
-impl SessionStore for MemoryStore {
-    fn load(&self, account: &str) -> Result<Option<SmartSession>, CliError> {
-        Ok(self.items.lock().expect("the store").get(account).cloned())
-    }
-    fn save(&self, session: &SmartSession) -> Result<(), CliError> {
-        self.items
-            .lock()
-            .expect("the store")
-            .insert(session.account(), session.clone());
-        Ok(())
-    }
-    fn delete(&self, account: &str) -> Result<bool, CliError> {
-        Ok(self
-            .items
-            .lock()
-            .expect("the store")
-            .remove(account)
-            .is_some())
-    }
 }
 
 /// One signed-in patient, as the index records it. No token, no name.
@@ -385,10 +429,34 @@ mod tests {
         let s = test_session("clinic", "a-1.E-1", None, 0);
         assert_eq!(s.account(), "smart/clinic/a-1.E-1");
         assert_eq!(entry("clinic", "a-1.E-1", None).key(), s.account());
-        let store = MemoryStore::default();
+        let store = pk_med_smart::MemoryStore::default();
         store.save(&s).unwrap();
         assert!(store.load("smart/clinic/a-1.E-1").unwrap().is_some());
         assert!(store.delete("smart/clinic/a-1.E-1").unwrap());
+    }
+
+    #[test]
+    fn a_legacy_sign_in_reads_for_its_revocation_and_hides_its_tokens() {
+        let item: LegacySignIn = serde_json::from_value(serde_json::json!({
+            "access_token": "access-secret",
+            "refresh_token": "refresh-secret",
+            "expires_at": 1,
+            "scope": "openid",
+            "patient": "a-1.E-1",
+            "client_id": "client",
+            "fhir_base": "https://example.invalid/fhir/r4",
+            "token_endpoint": "https://example.invalid/token",
+            "revocation_endpoint": "https://example.invalid/revoke",
+            "refreshed_at": 1
+        }))
+        .unwrap();
+        assert_eq!(
+            item.revocation_endpoint.as_deref(),
+            Some("https://example.invalid/revoke")
+        );
+        let shown = format!("{item:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(legacy_account("clinic", "a-1.E-1"), "clinic/a-1.E-1");
     }
 
     #[test]

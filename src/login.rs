@@ -138,9 +138,10 @@ impl Pending {
 }
 
 /// athena's start page, on 127.0.0.1 at a port the system picks, served
-/// from a thread until the sign-in is done. It answers `GET /` with a `Host`
-/// of its own (a page elsewhere that rebinds a name to 127.0.0.1 sends its
-/// own), and 404 to anything else.
+/// from a thread until the sign-in is done, each connection on a short-lived
+/// thread of its own (a browser's idle speculative connection then holds up
+/// nothing). It answers `GET /` with a `Host` of its own (a page elsewhere
+/// that rebinds a name to 127.0.0.1 sends its own), and 404 to anything else.
 struct StartPage {
     url: String,
     stop: Arc<AtomicBool>,
@@ -159,10 +160,14 @@ impl StartPage {
         listener.set_nonblocking(true).map_err(listen)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
+        let page = Arc::new(page);
         let thread = thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => answer(stream, port, &page),
+                    Ok((stream, _)) => {
+                        let page = Arc::clone(&page);
+                        thread::spawn(move || answer(stream, port, &page));
+                    }
                     Err(_) => thread::sleep(Duration::from_millis(50)),
                 }
             }
@@ -186,7 +191,7 @@ impl Drop for StartPage {
 
 fn answer(mut stream: TcpStream, port: u16, page: &str) {
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
@@ -350,6 +355,13 @@ mod tests {
         assert!(own.starts_with("HTTP/1.1 200"), "{own}");
         assert!(own.contains("<p>the page</p>"));
         assert!(own.contains("Cache-Control: no-store"));
+        // An idle connection, as a browser opens speculatively, holds up
+        // nothing.
+        let _idle = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let started = std::time::Instant::now();
+        let again = get(port, &format!("localhost:{port}"), "/");
+        assert!(again.starts_with("HTTP/1.1 200"), "{again}");
+        assert!(started.elapsed() < Duration::from_secs(1));
         let rebound = get(port, &format!("rebound.example.test:{port}"), "/");
         assert!(rebound.starts_with("HTTP/1.1 404"), "{rebound}");
         let elsewhere = get(port, &format!("127.0.0.1:{port}"), "/favicon.ico");
