@@ -13,7 +13,9 @@
 //! Its mode (`POST /__mock/mode?set=<mode>`) switches the error paths on:
 //! `normal`, `expired` (every access token is refused until refreshed),
 //! `revoked` (every refresh is `invalid_grant`), `deny` (the sign-in is
-//! cancelled), `down` (FHIR answers 503), `forbidden` (FHIR answers 403).
+//! cancelled), `nonce` (the ID token carries another sign-in's nonce),
+//! `down` (FHIR answers 503), `page2-down` (Observation's second page answers
+//! 503), `forbidden` (FHIR answers 403).
 
 #![allow(dead_code)]
 
@@ -301,6 +303,12 @@ impl Mock {
                 s.access.push(access.clone());
                 s.refresh.push(refresh.clone());
                 let granted: Vec<&str> = scope.split(' ').collect();
+                // `nonce`: an ID token that answers some other sign-in.
+                let nonce = if s.mode == "nonce" {
+                    "another-sign-in".to_string()
+                } else {
+                    nonce
+                };
                 let id_token = jwt(&serde_json::json!({
                     "iss": format!("{}/oauth2/mock", self.origin()),
                     "aud": CLIENT_ID,
@@ -384,6 +392,7 @@ impl Mock {
             }
         }
         let malformed = s.mode == "malformed";
+        let page2_down = s.mode == "page2-down";
         drop(s);
         let serve = |text: &str| fhir_json(200, &text.replace("{{BASE}}", &base));
         if !id.is_empty() {
@@ -412,6 +421,7 @@ impl Mock {
             // An entry with no resourceType, then a good one.
             "Condition" if malformed => serve(fixture("Condition-malformed").unwrap()),
             "ServiceRequest" => fhir_json(400, fixture("outcome-unsupported").unwrap()),
+            "Observation" if q.get("cursor").map(String::as_str) == Some("2") && page2_down => fhir_json(503, "Service Unavailable"),
             "Observation" if q.get("cursor").map(String::as_str) == Some("2") => serve(fixture("Observation-page2").unwrap()),
             t => match fixture(t) {
                 Some(text) if t != "Patient" => serve(text),

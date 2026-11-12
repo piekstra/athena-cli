@@ -21,12 +21,13 @@ use crate::directory::{self, Directory};
 use crate::documents;
 use crate::env::Environment;
 use crate::export;
-use crate::fhir::{self, Client};
+use crate::fhir::{Client, Live};
 use crate::login;
-use crate::oauth;
-use crate::session::{self, KeychainStore, SessionEntry, SessionIndex, TokenSet, TokenStore};
+use crate::logout;
+use crate::session::{self, SessionEntry, SessionIndex};
 use crate::stream::{self, Header};
 use crate::{unix_now, BIN, REPO, VERSION};
+use pk_med_smart::SmartSession;
 
 /// Unofficial; not affiliated with or endorsed by athenahealth. A patient's or
 /// caregiver's own records from athenahealth practices, through athenahealth's
@@ -459,6 +460,7 @@ fn auth_login(ctx: &Ctx, args: LoginCmd) -> Result<(), CliError> {
     let pending = login::prepare(
         &http,
         &login::Request {
+            org: &args.org,
             practice: &practice,
             org_name: &org_name,
             client_id: &client_id,
@@ -475,22 +477,21 @@ fn auth_login(ctx: &Ctx, args: LoginCmd) -> Result<(), CliError> {
             eprintln!("{e}; open {url} in a browser to sign in.");
         }
     }
-    let outcome = pending.finish(&http, unix_now())?;
-    let patient = outcome.tokens.patient.clone();
-    let key = session::key(&args.org, &patient);
-    let store = KeychainStore::new();
-    lock.store_signin(|| store.set(&key, &outcome.tokens))?;
+    let outcome = pending.finish(&http, unix_secs())?;
+    let signed_in = outcome.session;
+    let patient = signed_in.patient.clone().unwrap_or_default();
+    let store = session::keychain();
+    lock.store_signin(|| store.save(&signed_in))?;
 
-    let tokens = outcome.tokens;
     let mut entry = SessionEntry {
         org: args.org.clone(),
         patient: patient.clone(),
         label: args.label.clone(),
         relationship: outcome.relationship.map(str::to_string),
         environment: practice.environment,
-        fhir_base: tokens.fhir_base.clone(),
+        fhir_base: signed_in.fhir_base.clone(),
         stored_at: dates::fmt_rfc3339(unix_now()),
-        signin_expires_at: Some(dates::fmt_rfc3339(tokens.signin_expires_at())),
+        signin_expires_at: Some(rfc3339(session::signin_expires_at(&signed_in))),
     };
     // A sign-in that keeps the label of another patient at this practice
     // takes it over.
@@ -508,8 +509,9 @@ fn auth_login(ctx: &Ctx, args: LoginCmd) -> Result<(), CliError> {
     index.save(&sessions_path)?;
 
     // Prove the session with one read; the record itself is discarded.
-    let mut client = Client::new(&http, &store, Some(&lock), key, tokens.clone());
-    let verified = match client.read(&format!("Patient/{patient}")) {
+    let live = Live::start(store, lock, http.clone(), signed_in.clone())?;
+    let client = Client::new(http, live)?;
+    let verified = match client.read("Patient", &patient) {
         Ok(_) => true,
         Err(e) => {
             eprintln!(
@@ -520,8 +522,9 @@ fn auth_login(ctx: &Ctx, args: LoginCmd) -> Result<(), CliError> {
             false
         }
     };
-    if client.tokens().refreshed_at != tokens.refreshed_at {
-        entry.signin_expires_at = Some(dates::fmt_rfc3339(client.tokens().signin_expires_at()));
+    let after = client.session();
+    if renewed(&signed_in, &after) {
+        entry.signin_expires_at = Some(rfc3339(session::signin_expires_at(&after)));
         index.upsert(entry.clone());
         index.save(&sessions_path)?;
     }
@@ -568,8 +571,8 @@ fn auth_status(ctx: &Ctx, select: &Select) -> Result<(), CliError> {
     }
     let index = ctx.index()?;
     let entries = index.matching(select.patient.as_deref(), select.org.as_deref());
-    let now = unix_now();
-    let store = KeychainStore::new();
+    let now = unix_secs();
+    let store = session::keychain();
     let mut sessions = Vec::new();
     let mut any_usable = false;
     for entry in entries {
@@ -583,24 +586,27 @@ fn auth_status(ctx: &Ctx, select: &Select) -> Result<(), CliError> {
             row.insert("relationship".into(), json!(rel));
         }
         row.insert("environment".into(), json!(entry.environment));
-        match store.get(&entry.key()) {
-            Ok(Some(tokens)) => {
-                let usable = tokens.usable(now);
+        match store.load(&entry.key()) {
+            Ok(Some(stored)) => {
+                let usable = session::usable(&stored, now);
                 any_usable |= usable;
                 row.insert("credential_in_keychain".into(), json!(true));
                 row.insert("usable".into(), json!(usable));
                 row.insert(
                     "refresh_token".into(),
-                    json!(tokens.refresh_token.is_some()),
+                    json!(stored.tokens.refresh_token.is_some()),
                 );
                 row.insert(
                     "access_expires_at".into(),
-                    json!(dates::fmt_rfc3339(tokens.expires_at)),
+                    json!(stored.tokens.expires_at.map(rfc3339)),
                 );
                 row.insert(
                     "signin_expires_at".into(),
-                    json!(dates::fmt_rfc3339(tokens.signin_expires_at())),
+                    json!(rfc3339(session::signin_expires_at(&stored))),
                 );
+                if let Some(at) = stored.refused_at {
+                    row.insert("refused_at".into(), json!(rfc3339(at)));
+                }
             }
             Ok(None) => {
                 row.insert("credential_in_keychain".into(), json!(false));
@@ -610,8 +616,9 @@ fn auth_status(ctx: &Ctx, select: &Select) -> Result<(), CliError> {
                 row.insert("usable".into(), json!(false));
                 row.insert("error".into(), json!(e.code()));
                 eprintln!(
-                    "warning: reading {} from the keychain failed: {}",
-                    entry.key(),
+                    "warning: reading the sign-in of {} at {} from the keychain failed: {}",
+                    entry.patient,
+                    entry.org,
                     e.message()
                 );
             }
@@ -672,29 +679,53 @@ fn auth_logout(ctx: &Ctx, args: LogoutCmd) -> Result<(), CliError> {
         )));
     }
     let http = BlockingTransport::new()?;
-    let store = KeychainStore::new();
-    let mut out = Vec::new();
+    let store = session::keychain();
+    let legacy = session::credential_store();
+    let lock = RefreshLock::for_binary(BIN)?;
+    let mut done = Vec::new();
+    let mut incomplete = Vec::new();
+    // The first v0.2.x item that could not be removed: the command ends with
+    // its code once its one document is out.
+    let mut left_behind: Option<CliError> = None;
     for entry in chosen {
-        let key = entry.key();
-        let mut revoked = false;
-        if let Ok(Some(tokens)) = store.get(&key) {
-            revoked = revoke_all(&http, &tokens);
-        }
-        let found = RefreshLock::forget_for_binary(BIN, || store.delete(&key))?;
-        index.remove(&entry.org, &entry.patient);
-        index.save(&sessions_path)?;
-        out.push(json!({
+        let result = logout::sign_out(&http, &lock, &*store, &legacy, &entry.org, &entry.patient)?;
+        let mut row = json!({
             "org": entry.org,
             "patient": entry.patient,
             "label": entry.label,
-            "credential_removed": found,
-            "revoked": revoked,
-        }));
+            "credential_removed": result.credential_removed,
+            "revoked": result.revoked,
+        });
+        match result.left_behind {
+            None => {
+                index.remove(&entry.org, &entry.patient);
+                index.save(&sessions_path)?;
+                done.push(row);
+            }
+            Some(e) => {
+                // The patient stays in the index, so a second `auth logout`
+                // retries the item.
+                eprintln!(
+                    "warning: {}. Run `athena auth logout` again and allow the Keychain \
+                     prompt, or remove it with `security delete-generic-password -s {} -a \
+                     <profile>/<patient>`",
+                    e.message(),
+                    session::service()
+                );
+                row["error"] = json!({"code": e.code(), "message": e.message()});
+                incomplete.push(row);
+                left_behind.get_or_insert(e);
+            }
+        }
     }
     if ctx.json {
-        output::json(&json!({"schema": "auth-logout/v1", "signed_out": out}));
+        output::json(&json!({
+            "schema": "auth-logout/v1",
+            "signed_out": done,
+            "incomplete": incomplete,
+        }));
     } else {
-        for row in &out {
+        for row in &done {
             println!(
                 "Signed out {} at {}{}.",
                 row["patient"].as_str().unwrap_or_default(),
@@ -706,36 +737,19 @@ fn auth_logout(ctx: &Ctx, args: LogoutCmd) -> Result<(), CliError> {
                 }
             );
         }
-    }
-    Ok(())
-}
-
-/// Revoke the refresh and access tokens, best effort.
-fn revoke_all(http: &dyn crate::http::Http, tokens: &TokenSet) -> bool {
-    let Some(endpoint) = &tokens.revocation_endpoint else {
-        return false;
-    };
-    let mut ok = true;
-    if let Some(rt) = &tokens.refresh_token {
-        if let Err(e) = oauth::revoke(http, endpoint, &tokens.client_id, rt, "refresh_token") {
-            eprintln!(
-                "warning: revoking the refresh token failed: {}",
-                e.message()
+        for row in &incomplete {
+            println!(
+                "Did not finish signing out {} at {}: its v0.2.x sign-in is still in the \
+                 Keychain. Run `athena auth logout` again.",
+                row["patient"].as_str().unwrap_or_default(),
+                row["org"].as_str().unwrap_or_default(),
             );
-            ok = false;
         }
     }
-    if let Err(e) = oauth::revoke(
-        http,
-        endpoint,
-        &tokens.client_id,
-        &tokens.access_token,
-        "access_token",
-    ) {
-        eprintln!("warning: revoking the access token failed: {}", e.message());
-        ok = false;
+    if let Some(e) = left_behind {
+        std::process::exit(e.exit_code());
     }
-    ok
+    Ok(())
 }
 
 // ---------------------------------------------------------------- config
@@ -1061,27 +1075,51 @@ fn resolve_entry(ctx: &Ctx, select: &Select) -> Result<SessionEntry, CliError> {
         .resolve(select.patient.as_deref(), select.org.as_deref())
 }
 
-fn open_session(ctx: &Ctx, select: &Select) -> Result<(SessionEntry, TokenSet), CliError> {
+fn open_session(ctx: &Ctx, select: &Select) -> Result<(SessionEntry, SmartSession), CliError> {
     let entry = resolve_entry(ctx, select)?;
-    let tokens = KeychainStore::new().get(&entry.key())?.ok_or_else(|| {
-        CliError::Auth(format!(
-            "the keychain holds no sign-in for {} at {}",
-            entry.patient, entry.org
-        ))
-        .because(Reason::NoCredential)
-        .with_remedy(format!(
-            "sign in again with `athena auth login --org {}`",
-            entry.org
-        ))
-    })?;
-    Ok((entry, tokens))
+    let stored = session::load(&*session::keychain(), &entry)?;
+    Ok((entry, stored))
 }
 
-/// Keep the index's expiry in step after a command renewed the token.
-fn note_renewal(ctx: &Ctx, entry: &SessionEntry, before: &TokenSet, after: &TokenSet) {
-    if before.refreshed_at == after.refreshed_at
-        && before.signin_expires_at() == after.signin_expires_at()
-    {
+/// Whether a grant answered, or was refused, between `before` and `after`.
+fn renewed(before: &SmartSession, after: &SmartSession) -> bool {
+    before.tokens.obtained_at != after.tokens.obtained_at || before.refused_at != after.refused_at
+}
+
+/// A read client over a stored sign-in, its token renewed first when it has
+/// lapsed or was refused. A refused renewal is recorded in the index.
+fn start_client(
+    ctx: &Ctx,
+    entry: &SessionEntry,
+    stored: &SmartSession,
+) -> Result<Client, CliError> {
+    let started = BlockingTransport::new().and_then(|http| {
+        let live = Live::start(
+            session::keychain(),
+            RefreshLock::for_binary(BIN)?,
+            http.clone(),
+            stored.clone(),
+        )?;
+        Client::new(http, live)
+    });
+    match started {
+        Ok(client) if ctx.quiet => Ok(client),
+        Ok(client) => Ok(client.on_retry(|line| eprintln!("{line}"))),
+        Err(e) => {
+            if e.reason() == Some(Reason::CredentialRefused) {
+                let mut refused = stored.clone();
+                refused.refused_at = Some(unix_secs());
+                note_renewal(ctx, entry, stored, &refused);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Keep the index's expiry in step after a command renewed the token, or
+/// athenahealth refused the renewal.
+fn note_renewal(ctx: &Ctx, entry: &SessionEntry, before: &SmartSession, after: &SmartSession) {
+    if !renewed(before, after) {
         return;
     }
     let Ok(path) = ctx.sessions_path() else {
@@ -1091,7 +1129,7 @@ fn note_renewal(ctx: &Ctx, entry: &SessionEntry, before: &TokenSet, after: &Toke
         return;
     };
     let mut updated = entry.clone();
-    updated.signin_expires_at = Some(dates::fmt_rfc3339(after.signin_expires_at()));
+    updated.signin_expires_at = Some(rfc3339(session::signin_expires_at(after)));
     index.upsert(updated);
     let _ = index.save(&path);
 }
@@ -1155,57 +1193,54 @@ fn stream_header(ctx: &Ctx, entry: &SessionEntry, since: Option<&str>) -> Result
     ))
 }
 
-/// What an export needs before its first byte: a failure here writes
-/// nothing anywhere.
+/// What an export needs before its first byte, the token renewed when due:
+/// a failure here writes nothing anywhere.
 struct Prepared {
     entry: SessionEntry,
-    tokens: TokenSet,
+    stored: SmartSession,
     header: Header,
-    http: BlockingTransport,
-    lock: RefreshLock,
+    client: Client,
 }
 
 fn prepare_export(ctx: &Ctx, args: &ExportCmd) -> Result<Prepared, CliError> {
-    let (entry, tokens) = open_session(ctx, &args.select)?;
+    let (entry, stored) = open_session(ctx, &args.select)?;
     let header = stream_header(ctx, &entry, args.since.as_deref())?;
+    let client = start_client(ctx, &entry, &stored)?;
     Ok(Prepared {
         entry,
-        tokens,
+        stored,
         header,
-        http: BlockingTransport::new()?,
-        lock: RefreshLock::for_binary(BIN)?,
+        client,
     })
-}
-
-/// Run `f` with a read client over the prepared sign-in, then record a
-/// renewal it made in the session index, whatever `f` returned.
-fn with_client<T>(ctx: &Ctx, p: &Prepared, f: impl FnOnce(&mut Client<'_>) -> T) -> T {
-    let store = KeychainStore::new();
-    let mut client = Client::new(
-        &p.http,
-        &store,
-        Some(&p.lock),
-        p.entry.key(),
-        p.tokens.clone(),
-    );
-    let out = f(&mut client);
-    note_renewal(ctx, &p.entry, &p.tokens, client.tokens());
-    out
 }
 
 fn now_rfc3339() -> String {
     dates::fmt_rfc3339(unix_now())
 }
 
+fn unix_secs() -> u64 {
+    unix_now().max(0) as u64
+}
+
+/// Unix seconds as RFC 3339.
+fn rfc3339(at: u64) -> String {
+    dates::fmt_rfc3339(at as i64)
+}
+
 fn export_to_stdout(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
-    let p = prepare_export(ctx, args)?;
+    let Prepared {
+        entry,
+        stored,
+        header,
+        client,
+    } = prepare_export(ctx, args)?;
     let since = args.since.as_deref();
     let stdout = std::io::stdout();
-    let (_, error) = with_client(ctx, &p, |client| {
-        export::write_stream(BufWriter::new(stdout.lock()), &p.header, now_rfc3339, |w| {
-            export::export(client, w, since)
-        })
-    })?;
+    let written = export::write_stream(BufWriter::new(stdout.lock()), &header, now_rfc3339, |w| {
+        export::export(&client, w, since)
+    });
+    note_renewal(ctx, &entry, &stored, &client.session());
+    let (_, error) = written?;
     error.map_or(Ok(()), Err)
 }
 
@@ -1225,13 +1260,18 @@ fn export_to_dir(ctx: &Ctx, args: &ExportCmd) -> Result<(), CliError> {
              which runs `{BIN} records export --patient {who} --ndjson`"
         )));
     }
-    let p = prepare_export(ctx, args)?;
+    let Prepared {
+        entry,
+        stored,
+        header,
+        client,
+    } = prepare_export(ctx, args)?;
     let since = args.since.as_deref();
-    let (export, error) = with_client(ctx, &p, |client| {
-        export::write_dir(&dir, &p.header, now_rfc3339, |w| {
-            export::export(client, w, since)
-        })
-    })?;
+    let written = export::write_dir(&dir, &header, now_rfc3339, |w| {
+        export::export(&client, w, since)
+    });
+    note_renewal(ctx, &entry, &stored, &client.session());
+    let (export, error) = written?;
     // One records-export/v1 document, complete or not (medical-common
     // DESIGN 1.5); a pull cut short then exits with its error's code.
     if ctx.json {
@@ -1302,13 +1342,10 @@ fn documents_cmd(ctx: &Ctx, cmd: DocumentsCmd) -> Result<(), CliError> {
     match cmd {
         DocumentsCmd::List { select, range } => {
             range.validate()?;
-            let (entry, tokens) = open_session(ctx, &select)?;
-            let http = BlockingTransport::new()?;
-            let lock = RefreshLock::for_binary(BIN)?;
-            let store = KeychainStore::new();
-            let mut client = Client::new(&http, &store, Some(&lock), entry.key(), tokens.clone());
-            let items = documents::list(&mut client, &range);
-            note_renewal(ctx, &entry, &tokens, client.tokens());
+            let (entry, stored) = open_session(ctx, &select)?;
+            let client = start_client(ctx, &entry, &stored)?;
+            let items = documents::list(&client, &range);
+            note_renewal(ctx, &entry, &stored, &client.session());
             let docs: Vec<_> = items?.into_iter().map(|i| i.document).collect();
             let page = Paged::new("document", docs);
             page.emit(ctx.json);
@@ -1340,26 +1377,23 @@ fn documents_cmd(ctx: &Ctx, cmd: DocumentsCmd) -> Result<(), CliError> {
                     });
                 }
             }
-            let (entry, tokens) = open_session(ctx, &select)?;
+            let (entry, stored) = open_session(ctx, &select)?;
             if (all || documents::is_dir_target(&out)) && !out.is_dir() {
                 create_private_dir(&out)?;
             }
-            let http = BlockingTransport::new()?;
-            let lock = RefreshLock::for_binary(BIN)?;
-            let store = KeychainStore::new();
-            let mut client = Client::new(&http, &store, Some(&lock), entry.key(), tokens.clone());
+            let client = start_client(ctx, &entry, &stored)?;
             let result = if all {
-                download_all(ctx, &mut client, &out, &range)
+                download_all(ctx, &client, &out, &range)
             } else {
-                download_one(ctx, &mut client, id.as_deref().unwrap_or_default(), &out)
+                download_one(ctx, &client, id.as_deref().unwrap_or_default(), &out)
             };
-            note_renewal(ctx, &entry, &tokens, client.tokens());
+            note_renewal(ctx, &entry, &stored, &client.session());
             result
         }
     }
 }
 
-fn download_one(ctx: &Ctx, client: &mut Client<'_>, id: &str, out: &Path) -> Result<(), CliError> {
+fn download_one(ctx: &Ctx, client: &Client, id: &str, out: &Path) -> Result<(), CliError> {
     let item = documents::find(client, id)?;
     let fetched = documents::fetch(client, &item).map_err(|f| f.error)?;
     let path = documents::target(out, &item, fetched.content_type.as_deref());
@@ -1380,12 +1414,7 @@ fn download_one(ctx: &Ctx, client: &mut Client<'_>, id: &str, out: &Path) -> Res
     Ok(())
 }
 
-fn download_all(
-    ctx: &Ctx,
-    client: &mut Client<'_>,
-    dir: &Path,
-    range: &RangeArgs,
-) -> Result<(), CliError> {
+fn download_all(ctx: &Ctx, client: &Client, dir: &Path, range: &RangeArgs) -> Result<(), CliError> {
     let items = documents::list(client, range)?;
     let mut saved = Vec::new();
     let mut skipped = Vec::new();
@@ -1447,20 +1476,23 @@ fn api(ctx: &Ctx, args: ApiCmd) -> Result<(), CliError> {
     if args.path.trim().is_empty() {
         return Err(CliError::Usage("api needs a path".into()));
     }
-    let (entry, tokens) = open_session(ctx, &args.select)?;
-    let http = BlockingTransport::new()?;
-    let lock = RefreshLock::for_binary(BIN)?;
-    let store = KeychainStore::new();
-    let mut client = Client::new(&http, &store, Some(&lock), entry.key(), tokens.clone());
-    let result = client
-        .resolve(&args.path)
-        .and_then(|url| client.get(&url, fhir::FHIR_JSON));
-    note_renewal(ctx, &entry, &tokens, client.tokens());
-    let response = result?;
-    client.check(&response, &args.path)?;
-    match serde_json::from_str::<Value>(&response.body) {
+    let path = args.path.trim();
+    let (entry, stored) = open_session(ctx, &args.select)?;
+    // A URL elsewhere is the caller's mistake, refused before the token
+    // could travel: exit 2.
+    if path.contains("://") && !crate::http::same_origin(path, &entry.fhir_base) {
+        return Err(CliError::Usage(
+            "that URL is not on the signed-in FHIR server; athena sends its token nowhere else"
+                .into(),
+        ));
+    }
+    let client = start_client(ctx, &entry, &stored)?;
+    let result = client.get_raw(path.trim_start_matches('/'));
+    note_renewal(ctx, &entry, &stored, &client.session());
+    let body = result?;
+    match serde_json::from_str::<Value>(&body) {
         Ok(value) => output::json(&value),
-        Err(_) => println!("{}", response.body),
+        Err(_) => println!("{body}"),
     }
     Ok(())
 }
@@ -1479,48 +1511,36 @@ mod tests {
             quiet: true,
             store: ConfigStore::new(BIN).with_override(Some(dir.join("config.json"))),
         };
-        let now = unix_now();
-        let before = TokenSet {
-            access_token: "access-1".into(),
-            refresh_token: Some("refresh-1".into()),
-            expires_at: now + 3600,
-            scope: "openid".into(),
-            patient: "a-900001.E-1001".into(),
-            client_id: "client".into(),
-            fhir_base: "http://127.0.0.1:9/fhir/r4".into(),
-            token_endpoint: "http://127.0.0.1:9/token".into(),
-            revocation_endpoint: None,
-            issuer: None,
-            fhir_user: None,
-            refreshed_at: now,
-        };
+        let now = unix_secs();
+        let mut before = session::test_session("mock", "a-900001.E-1001", None, now);
+        before.tokens.refresh_token = Some("refresh-1".into());
         let entry = SessionEntry {
             org: "mock".into(),
-            patient: before.patient.clone(),
+            patient: "a-900001.E-1001".into(),
             label: None,
             relationship: None,
             environment: Environment::Custom,
             fhir_base: before.fhir_base.clone(),
-            stored_at: dates::fmt_rfc3339(now),
-            signin_expires_at: Some(dates::fmt_rfc3339(before.signin_expires_at())),
+            stored_at: rfc3339(now),
+            signin_expires_at: Some(rfc3339(session::signin_expires_at(&before))),
         };
         let mut index = SessionIndex::default();
         index.upsert(entry.clone());
         index.save(&ctx.sessions_path().unwrap()).unwrap();
-        // What `Client::renew` keeps after an invalid_grant: same refresh
-        // time, no refresh token, access expired now.
-        let dead = TokenSet {
-            refresh_token: None,
-            expires_at: now,
-            ..before.clone()
-        };
-        note_renewal(&ctx, &entry, &before, &dead);
+        // What the renewer stores after an invalid_grant: the same tokens,
+        // stamped refused.
+        let mut refused = before.clone();
+        refused.refused_at = Some(now + 7);
+        note_renewal(&ctx, &entry, &before, &refused);
         let saved = SessionIndex::load(&ctx.sessions_path().unwrap()).unwrap();
         assert_eq!(
             saved.sessions[0].signin_expires_at.as_deref(),
-            Some(dates::fmt_rfc3339(now).as_str())
+            Some(rfc3339(now + 7).as_str())
         );
-        assert!(!dead.usable(now));
+        assert!(!session::usable(&refused, now));
+        // Nothing answered: the index is left alone.
+        let unchanged = before.clone();
+        assert!(!renewed(&before, &unchanged));
     }
 
     #[test]

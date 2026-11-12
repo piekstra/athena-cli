@@ -14,30 +14,36 @@ from [cli-common](https://github.com/piekstra/cli-common).
 | `src/config.rs` | `config.json`: client ids per environment, redirect ports, practice profiles and their FHIR base |
 | `src/env.rs` | athenahealth's Preview and Production hosts, and custom servers |
 | `src/directory.rs` | athenahealth's FHIR base URL Bundle: download, the cut-down local copy, search |
-| `src/smart.rs` | `.well-known/smart-configuration` discovery, scopes, granted types, `self` or `proxy` |
-| `src/oauth.rs` | PKCE, the authorize URL, the loopback listener, code exchange, refresh, revoke |
-| `src/login.rs` | one sign-in from start page to token set, and the "Log in with athenahealth" start page |
-| `src/session.rs` | the token set, one Keychain item per (practice profile, patient) behind `TokenStore`, and the session index (`sessions.json`) |
-| `src/fhir.rs` | the read client: renewal under the refresh lock, retries, same-origin paging, status to error |
+| `src/smart.rs` | athenahealth's `VendorQuirks` (none beyond the defaults), the scopes, granted types, `self` or `proxy` |
+| `src/oauth.rs` | token revocation for `auth logout` |
+| `src/logout.rs` | `auth logout` for one patient: revoke and delete its sign-in and a v0.2.x item (`LegacyItems` is the test seam) |
+| `src/login.rs` | one sign-in through `pk_med_smart` (discover, begin, exchange), and the "Log in with athenahealth" start page on a loopback port of its own |
+| `src/session.rs` | the Keychain store of `SmartSession`s (account `smart/<profile>/<patient>`), the 90-day horizon, and the session index (`sessions.json`) |
+| `src/fhir.rs` | the read client: `pk_med_fhir::FhirClient` with athenahealth's `RetryPolicy`, the `Live` bearer source renewing through `pk_med_smart::Renewer`, and the circuit breaker |
 | `src/export.rs` | the export plan: searches, referenced reads, `Binary` after its parent, skips |
 | `src/stream.rs` | `pk-med-records`' `records-stream/v1` writer and DTOs, re-exported, and athena's header |
 | `src/documents.rs` | `documents/v1` over DocumentReference and DiagnosticReport, `Binary` fetch and file-type check |
-| `src/http.rs` | the transport trait, origins |
+| `src/http.rs` | the request trait (revocation, the directory), origins |
 | `tests/support/mock.rs` | a mock athenahealth practice on 127.0.0.1 (also `make mock`) |
 | `docs/api.md` | athenahealth's behaviour and traps, quoted; read before changing sign-in or export |
 
-medical-common is pinned at v0.2.0, on the same cli-common tag (v0.31.1).
-From `pk-med-records`: the stream writer, its header, skip and trailer, the
-`Organization` and `PatientContext` DTOs, `records-export/v1` and the export
-file (`ExportFile`, committed after the trailer). From `pk-med-fhir`: `RawResource` and `outcome::status_error`. Tests
-read athena's stream back with `pk-med-records`' `RecordsReader`, as medrec
-does.
+medical-common is pinned at v0.4.2, on the same cli-common tag (v0.31.1).
+From `pk-med-smart`: discovery, the scope set, the launch (`begin`, with the
+OpenID nonce) and the code exchange, `SmartSession` and its Keychain store,
+and `Renewer`, which renews under the refresh lock and stamps a refused
+grant as `refused_at`. From `pk-med-fhir`: `FhirClient` (retries, the bearer
+source, same-origin paging and `Binary`, statuses to errors), `RawResource`
+and `outcome::status_error`. From `pk-med-records`: the stream writer, its
+header, skip and trailer, the `Organization` and `PatientContext` DTOs,
+`records-export/v1` and the export file (`ExportFile`, committed after the
+trailer). Tests read athena's stream back with `pk-med-records`'
+`RecordsReader`, as medrec does.
 
-`src/fhir.rs` keeps athena's own read client. `pk_med_fhir::FhirClient`
-takes a fixed bearer token; athena renews mid-export under the refresh lock,
-writes a refused sign-in back to the Keychain, and stops on the circuit
-breaker. `src/smart.rs`, `src/oauth.rs` and `src/session.rs` stand in for
-`pk-med-smart` until athena's sign-in moves onto it.
+athena's own code is what is athenahealth's: the retry policy's values, the
+circuit breaker (counted from `FhirClient`'s results in `fhir::Client`), the
+start page with athenahealth's button (cli-common's redirect listener answers
+only `/callback`), revocation (`pk_cli_auth::oauth` has none), and the
+90-day refresh horizon.
 
 ## Medical data
 
@@ -64,15 +70,16 @@ Medical records are the most sensitive data a household has.
 ## Credentials
 
 - One Keychain item per (practice profile, patient): service
-  `piekstra.athena`, account `<profile>/<patient>`, JSON holding the tokens,
-  the granted scope and the endpoints they belong to. Never printed, logged,
-  or put in argv.
+  `piekstra.athena`, account `smart/<profile>/<patient>`, a
+  `pk_med_smart::SmartSession` (the tokens, the granted scope, the endpoints
+  they belong to, `refused_at`, and athenahealth's revocation endpoint in
+  `extra`). Never printed, logged, or put in argv.
 - The client id is configuration (`config set client-id`), never code: each
   household registers its own app (`docs/registration.md`).
 - Renewals run under `pk_cli_auth::refresh_lock::RefreshLock`, so two
   processes never present one refresh token at once.
 - Tests and `make verify` never read the real Keychain: the in-process tests
-  use `MemoryStore`, and the surface tests and `smoke` set
+  use `pk_med_smart::MemoryStore`, and the surface tests and `smoke` set
   `ATHENA_KEYCHAIN_SERVICE` to an empty service and reach no command that
   reads it.
 - If an `athena` call hangs, it waits on a Keychain approval. Stop calling it

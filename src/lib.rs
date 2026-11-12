@@ -17,6 +17,7 @@ pub mod export;
 pub mod fhir;
 pub mod http;
 pub mod login;
+pub mod logout;
 pub mod oauth;
 pub mod session;
 pub mod smart;

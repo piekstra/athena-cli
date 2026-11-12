@@ -1,8 +1,6 @@
-//! The request seam the provider code is written against.
-//!
-//! Everything that talks to athenahealth takes a `&dyn Http`, so the tests
-//! drive the same code against the loopback mock, and the binary against
-//! `pk_cli_http::BlockingTransport`.
+//! The request seam for what athena sends itself: token revocation and the
+//! directory download. Sign-in and FHIR reads go through `pk_med_smart` and
+//! `pk_med_fhir` over `pk_cli_http::BlockingTransport`.
 
 use pk_cli_core::transport::{percent_encode, HttpRequest, HttpResponse, Transport};
 use pk_cli_core::CliError;

@@ -75,6 +75,15 @@ and chart sharing group ID(s) for that organization." ([FHIR Base URLs][base])
 
 ## Sign-in: SMART standalone patient launch
 
+athena signs in through medical-common's `pk_med_smart` (v0.4.2):
+`discover` reads `.well-known/smart-configuration` (and checks that an https
+server names only https endpoints), `begin` binds the redirect listener and
+builds the authorize URL with PKCE S256, state, `aud` and a nonce, and
+`SmartSignIn::exchange` trades the code and checks the nonce. athena adds
+athenahealth's start page and keeps its revocation endpoint
+(`src/login.rs`). `src/smart.rs` records why `Athenahealth`'s
+`VendorQuirks` are the defaults.
+
 ### Public client and PKCE
 
 athena is a native app with no secret. "PKCE is required by the token API for
@@ -137,7 +146,10 @@ a caregiver's sign-in.
 - "To obtain a refresh token in the token endpoint response, you must request
   the offline access scope." ([Authorize Endpoint][authorize])
 - `nonce` is "Required if requesting the openid scope" ([Authorize
-  Endpoint][authorize]); athena checks it against the id token.
+  Endpoint][authorize]). `pk_med_smart::begin` sends a fresh one whenever
+  `openid` is asked for, and `exchange` refuses an ID token that carries
+  another (exit 3, `CredentialRefused`). An answer with no ID token at all
+  is not refused.
 
 athena asks for the R4 types it reads. The auto-approved list also names
 DSTU2-era and proprietary types (`Assessment`, `ClinicalImpression`,
@@ -151,9 +163,14 @@ athenahealth asks patient-facing apps to start sign-in from its "Log in with
 athenahealth" button (CSS and logo from
 `identity-static-assets.platform.athenahealth.com/login-with-athenahealth/latest/`).
 Its sample script builds a production-only authorize URL with neither `aud`
-nor PKCE, so athena does not use the script: it serves its own start page on
-the loopback listener with the button's markup and classes, linking to the
-full authorize URL.
+nor PKCE, so athena does not use the script: it serves its own start page
+with the button's markup and classes, linking to the full authorize URL. The
+page is on a second 127.0.0.1 listener at a port the system picks, because
+cli-common's redirect listener (on 47816 or 47817) answers only `/callback`.
+It answers `GET /` with its own `Host` only, and stops when the sign-in ends.
+That listener's last page is cli-common's ("signed in", or "the sign-in did
+not complete"), and a cancelled sign-in is exit 3 with "the provider refused
+the sign-in (access_denied…)".
 
 ## Tokens
 
@@ -172,12 +189,19 @@ From the [Token Endpoint][token] page:
 - `redirect_uri` on the code exchange "must match the value for redirect_uri
   provided to the authorize endpoint".
 
-athena keeps a refresh token until a token answer carries a new one, records
-when it was last used, and reports the 90-day horizon as `signin_expires_at`.
-Every renewal runs under the family's refresh lock
-(`pk_cli_auth::refresh_lock`), so two processes never present one refresh
-token at once. **Unverified**: whether a refresh answer carries a new refresh
-token.
+A sign-in is one `pk_med_smart::SmartSession` in the Keychain, account
+`smart/<profile>/<patient>`. It keeps a refresh token until a token answer
+carries a new one, and `tokens.obtained_at` is the last grant, so athena
+reports the 90-day horizon as `signin_expires_at` from it. `pk_med_smart::Renewer` runs
+every renewal under the family's refresh lock (`pk_cli_auth::refresh_lock`),
+so two processes never present one refresh token at once. A token that has
+lapsed is renewed before the first request; one athenahealth refuses (401)
+is renewed once and the request sent again. A refused refresh grant stamps
+`refused_at` on the stored session and keeps the refresh token, so `auth
+status` reports the sign-in unusable (`refused_at`, and `signin_expires_at`
+then), and the next command tries one grant before it asks for a new
+sign-in. v0.2.x dropped the refresh token instead. **Unverified**: whether a
+refresh answer carries a new refresh token.
 
 Revocation is `POST /oauth2/v1/revoke` (RFC 7009); `auth logout` revokes the
 refresh and access tokens, then deletes the keychain item. The logout
@@ -185,6 +209,17 @@ endpoint "Terminates an end user's ... login session in the athenahealth login
 widget, which otherwise expires after 10 minutes of idle time ... terminating
 a login session will not invalidate any active access or refresh tokens"
 ([Additional OAuth Endpoints][oauth-extra]); athena has no use for it.
+
+v0.2.x stored a sign-in at `<profile>/<patient>`, which nothing else reads
+since v0.3.0, so `auth logout` revokes and deletes that item too (one that
+does not read as a sign-in is deleted unrevoked). Each row of
+`auth-logout/v1` has `credential_removed` and `revoked`, which is true only
+when every revocation tried for the patient's items succeeded. A patient whose
+v0.2.x item cannot be read or deleted (a denied Keychain prompt) is listed
+under `incomplete` with an `error`, not under `signed_out`. It stays in the
+index so a second `auth logout` retries it. The warning names the manual
+`security delete-generic-password` step, and the command exits with the
+error's code (1) after its one document.
 
 ## FHIR R4
 
@@ -257,12 +292,24 @@ consider use of jitter", and "Don't implement Retry for status code 429
 without ensuring the failed request is related to excessive concurrent
 requests and not the exceeding of a daily limit."
 
-athena sends one request at a time, retries 502 to 504 up to three times
-(1 s, 2 s, 4 s plus jitter, or the server's `Retry-After`), and retries a 429
-only when it carries a `Retry-After` of 30 s or less. A search that still
-fails is an `upstream` skip, but when three requests in a row fail that way
-the export stops with `complete: false` and exit 5 (the circuit breaker), and
-a failed `Patient` read stops it at once: exit 5, or exit 3 when the read is
+athena reads through medical-common's `pk_med_fhir::FhirClient` with this
+`RetryPolicy` (`fhir::retry_policy`): four requests in all, waiting 1 s, 2 s
+and 4 s, or the server's `Retry-After`, each wait lengthened by up to a
+quarter (jitter), never more than 30 s. A 502, 503 or 504 is asked again;
+another 5xx is not. A 429 is asked again only when its `Retry-After` is 30 s
+or less; one without, or asking for longer, fails at once. A connection that
+failed, and a 403 whose body is an HTML page (athenahealth's edge), are
+asked again the same way. Each wait is a line on stderr unless `--quiet`.
+v0.2.x capped a longer `Retry-After` on a 5xx at 30 s and did not retry the
+edge's 403.
+
+One request goes at a time. A search hands each page over as it is read
+(`search_pages`), so a page that fails keeps the pages before it in the
+stream, and the search is an `upstream` skip. When three requests in a row
+fail that way (a 429, a 5xx, the edge's block or a failed connection, after
+their retries; `fhir::Client` counts them from `FhirClient`'s results) the
+export stops with `complete: false` and exit 5 (the circuit breaker). A
+failed `Patient` read stops it at once: exit 5, or exit 3 when the read is
 refused (403), with the remedy to sign in again, since the practice may have
 turned off access for the app.
 

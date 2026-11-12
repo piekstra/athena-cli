@@ -137,17 +137,17 @@ fn category(resource: &Value) -> Option<String> {
 }
 
 /// Every document of the signed-in patient, newest first, within `range`.
-pub fn list(client: &mut Client<'_>, range: &RangeArgs) -> Result<Vec<Item>, CliError> {
+pub fn list(client: &Client, range: &RangeArgs) -> Result<Vec<Item>, CliError> {
     range.validate()?;
     let patient = client.patient().to_string();
     let mut items = Vec::new();
     for resource_type in ["DocumentReference", "DiagnosticReport"] {
-        client.search(resource_type, &[("patient", patient.clone())], |_, raw| {
-            if let Ok(value) = serde_json::from_str::<Value>(raw.get()) {
+        let found = client.search(resource_type, &[("patient", patient.clone())])?;
+        for resource in &found.resources {
+            if let Ok(value) = resource.value() {
                 items.extend(items_of(&value));
             }
-            Ok(())
-        })?;
+        }
     }
     items.retain(|item| {
         let date = item.document.date.as_deref();
@@ -203,14 +203,10 @@ fn bad_id(id: &str) -> CliError {
 }
 
 /// One document by id: its resource read, its file picked out.
-pub fn find(client: &mut Client<'_>, id: &str) -> Result<Item, CliError> {
+pub fn find(client: &Client, id: &str) -> Result<Item, CliError> {
     let (reference, n) = parse_id(id)?;
-    let body = client.read(&reference)?;
-    let value: Value = serde_json::from_str(&body).map_err(|_| {
-        CliError::Upstream(format!(
-            "{reference} came back as something other than JSON"
-        ))
-    })?;
+    let (resource_type, rid) = reference.split_once('/').unwrap_or_default();
+    let value = client.read(resource_type, rid)?.value()?;
     let mut items = items_of(&value);
     if n >= items.len() {
         return Err(CliError::NotFound(format!(
@@ -249,7 +245,7 @@ impl From<CliError> for FetchError {
 
 /// Fetch an item's bytes: inline, or the `Binary` its URL names on this
 /// FHIR server.
-pub fn fetch(client: &mut Client<'_>, item: &Item) -> Result<Fetched, FetchError> {
+pub fn fetch(client: &Client, item: &Item) -> Result<Fetched, FetchError> {
     let (data, content_type) = match &item.source {
         Source::Inline(data) => (data.clone(), item.content_type.clone()),
         Source::Url(url) => {
@@ -263,27 +259,17 @@ pub fn fetch(client: &mut Client<'_>, item: &Item) -> Result<Fetched, FetchError
                     ),
                 });
             }
-            let body = client.read(url).map_err(|error| FetchError {
+            let binary = client.binary(url).map_err(|error| FetchError {
                 code: match (error.base(), error.reason()) {
                     (CliError::NotFound(_), _) | (_, Some(Reason::Forbidden)) => SKIP_NO_FILE,
                     _ => SKIP_UPSTREAM,
                 },
                 error,
             })?;
-            let value: Value = serde_json::from_str(&body).map_err(|_| FetchError {
+            let value = binary.value().map_err(|error| FetchError {
                 code: SKIP_VERIFY_FAILED,
-                error: CliError::Upstream(
-                    "the Binary came back as something other than JSON".into(),
-                ),
+                error,
             })?;
-            if value["resourceType"] != "Binary" {
-                return Err(FetchError {
-                    code: SKIP_VERIFY_FAILED,
-                    error: CliError::Upstream(
-                        "the server answered with something other than a Binary".into(),
-                    ),
-                });
-            }
             let data = value["data"].as_str().unwrap_or_default().to_string();
             let content_type = value["contentType"]
                 .as_str()
