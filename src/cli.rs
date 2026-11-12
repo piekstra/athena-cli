@@ -23,7 +23,7 @@ use crate::env::Environment;
 use crate::export;
 use crate::fhir::{Client, Live};
 use crate::login;
-use crate::oauth;
+use crate::logout;
 use crate::session::{self, SessionEntry, SessionIndex};
 use crate::stream::{self, Header};
 use crate::{unix_now, BIN, REPO, VERSION};
@@ -680,59 +680,52 @@ fn auth_logout(ctx: &Ctx, args: LogoutCmd) -> Result<(), CliError> {
     }
     let http = BlockingTransport::new()?;
     let store = session::keychain();
-    let mut out = Vec::new();
-    // The first v0.2.x item that could not be removed: its entry stays in
-    // the index, so `auth logout` again retries it, and the command ends
-    // with its code once the one document is out.
+    let legacy = session::credential_store();
+    let lock = RefreshLock::for_binary(BIN)?;
+    let mut done = Vec::new();
+    let mut incomplete = Vec::new();
+    // The first v0.2.x item that could not be removed: the command ends with
+    // its code once its one document is out.
     let mut left_behind: Option<CliError> = None;
     for entry in chosen {
-        let key = entry.key();
-        // One result per item that existed: `revoked` only when all held.
-        let mut revocations = Vec::new();
-        if let Ok(Some(stored)) = store.load(&key) {
-            revocations.push(revoke_all(&http, &stored));
-        }
-        let mut found = RefreshLock::forget_for_binary(BIN, || store.delete(&key))?;
-        // A sign-in v0.2.x stored at `<org>/<patient>`: nothing else reaches
-        // it, so it is revoked and removed here.
-        let legacy = session::load_legacy(&entry.org, &entry.patient).and_then(|legacy| {
-            let Some(legacy) = legacy else {
-                return Ok(());
-            };
-            if let Some(legacy) = &legacy {
-                revocations.push(revoke_legacy(&http, legacy));
-            }
-            found |= session::delete_legacy(&entry.org, &entry.patient)?;
-            Ok(())
-        });
-        let legacy_left = legacy.is_err();
-        if let Err(e) = legacy {
-            eprintln!(
-                "warning: {}; the v0.2.x sign-in of {} at {} is still in the Keychain. Run \
-                 `athena auth logout` again and allow the Keychain prompt, or remove it with \
-                 `security delete-generic-password -s {} -a <profile>/<patient>`",
-                e.message(),
-                entry.patient,
-                entry.org,
-                session::service()
-            );
-            left_behind.get_or_insert(e);
-        } else {
-            index.remove(&entry.org, &entry.patient);
-            index.save(&sessions_path)?;
-        }
-        out.push(json!({
+        let result = logout::sign_out(&http, &lock, &*store, &legacy, &entry.org, &entry.patient)?;
+        let mut row = json!({
             "org": entry.org,
             "patient": entry.patient,
             "label": entry.label,
-            "credential_removed": found && !legacy_left,
-            "revoked": !revocations.is_empty() && revocations.iter().all(|ok| *ok),
-        }));
+            "credential_removed": result.credential_removed,
+            "revoked": result.revoked,
+        });
+        match result.left_behind {
+            None => {
+                index.remove(&entry.org, &entry.patient);
+                index.save(&sessions_path)?;
+                done.push(row);
+            }
+            Some(e) => {
+                // The patient stays in the index, so a second `auth logout`
+                // retries the item.
+                eprintln!(
+                    "warning: {}. Run `athena auth logout` again and allow the Keychain \
+                     prompt, or remove it with `security delete-generic-password -s {} -a \
+                     <profile>/<patient>`",
+                    e.message(),
+                    session::service()
+                );
+                row["error"] = json!({"code": e.code(), "message": e.message()});
+                incomplete.push(row);
+                left_behind.get_or_insert(e);
+            }
+        }
     }
     if ctx.json {
-        output::json(&json!({"schema": "auth-logout/v1", "signed_out": out}));
+        output::json(&json!({
+            "schema": "auth-logout/v1",
+            "signed_out": done,
+            "incomplete": incomplete,
+        }));
     } else {
-        for row in &out {
+        for row in &done {
             println!(
                 "Signed out {} at {}{}.",
                 row["patient"].as_str().unwrap_or_default(),
@@ -744,63 +737,19 @@ fn auth_logout(ctx: &Ctx, args: LogoutCmd) -> Result<(), CliError> {
                 }
             );
         }
+        for row in &incomplete {
+            println!(
+                "Did not finish signing out {} at {}: its v0.2.x sign-in is still in the \
+                 Keychain. Run `athena auth logout` again.",
+                row["patient"].as_str().unwrap_or_default(),
+                row["org"].as_str().unwrap_or_default(),
+            );
+        }
     }
     if let Some(e) = left_behind {
         std::process::exit(e.exit_code());
     }
     Ok(())
-}
-
-/// Revoke the refresh and access tokens, best effort.
-fn revoke_all(http: &dyn crate::http::Http, stored: &SmartSession) -> bool {
-    let Some(endpoint) = session::revocation_endpoint(stored) else {
-        return false;
-    };
-    let tokens = &stored.tokens;
-    let mut ok = true;
-    if let Some(rt) = &tokens.refresh_token {
-        if let Err(e) = oauth::revoke(http, endpoint, &stored.client_id, rt, "refresh_token") {
-            eprintln!(
-                "warning: revoking the refresh token failed: {}",
-                e.message()
-            );
-            ok = false;
-        }
-    }
-    if let Err(e) = oauth::revoke(
-        http,
-        endpoint,
-        &stored.client_id,
-        &tokens.access_token,
-        "access_token",
-    ) {
-        eprintln!("warning: revoking the access token failed: {}", e.message());
-        ok = false;
-    }
-    ok
-}
-
-/// [`revoke_all`] for a v0.2.x sign-in.
-fn revoke_legacy(http: &dyn crate::http::Http, legacy: &session::LegacySignIn) -> bool {
-    let Some(endpoint) = &legacy.revocation_endpoint else {
-        return false;
-    };
-    let mut ok = true;
-    let tokens = legacy
-        .refresh_token
-        .iter()
-        .map(|t| (t.as_str(), "refresh_token"))
-        .chain([(legacy.access_token.as_str(), "access_token")]);
-    for (token, hint) in tokens {
-        if let Err(e) = oauth::revoke(http, endpoint, &legacy.client_id, token, hint) {
-            eprintln!(
-                "warning: revoking the v0.2.x {hint} failed: {}",
-                e.message()
-            );
-            ok = false;
-        }
-    }
-    ok
 }
 
 // ---------------------------------------------------------------- config

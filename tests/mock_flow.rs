@@ -4,8 +4,9 @@
 
 mod support;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -15,11 +16,13 @@ use athena::env::Environment;
 use athena::export;
 use athena::fhir::{Client, Live};
 use athena::login;
+use athena::logout::{self, LegacyItems};
 use athena::session::{self, key};
 use athena::stream;
 use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_core::{CliError, RangeArgs, Reason};
 use pk_cli_http::BlockingTransport;
+use pk_cli_secrets::Secret;
 use pk_med_smart::{MemoryStore, SessionStore, SmartSession};
 use serde_json::Value;
 use support::mock::{self, Mock};
@@ -761,4 +764,142 @@ fn an_export_to_a_directory_commits_complete_streams_and_keeps_the_last_one() {
     names.sort();
     assert_eq!(names, vec!["records.ndjson".to_string()]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v0.2.x keychain items in memory. `denied` fails every read, as a denied
+/// Keychain prompt does.
+#[derive(Default)]
+struct OldItems {
+    items: Mutex<HashMap<String, String>>,
+    denied: bool,
+}
+
+impl OldItems {
+    fn holding(value: String) -> OldItems {
+        let old = OldItems::default();
+        old.items
+            .lock()
+            .unwrap()
+            .insert(logout::legacy_account("mock", mock::PATIENT), value);
+        old
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.lock().unwrap().is_empty()
+    }
+}
+
+impl LegacyItems for OldItems {
+    fn get(&self, account: &str) -> Result<Option<Secret>, CliError> {
+        if self.denied {
+            return Err(CliError::Keychain("access was not allowed".into()));
+        }
+        Ok(self
+            .items
+            .lock()
+            .unwrap()
+            .get(account)
+            .map(|v| Secret::new(v.clone())))
+    }
+    fn delete(&self, account: &str) -> Result<bool, CliError> {
+        Ok(self.items.lock().unwrap().remove(account).is_some())
+    }
+}
+
+/// A v0.2.x item as v0.2.x wrote it, revoked at `path` on the mock.
+fn old_sign_in(m: &Mock, path: &str) -> String {
+    serde_json::json!({
+        "access_token": "synthetic-old-access",
+        "refresh_token": "synthetic-old-refresh",
+        "expires_at": 1,
+        "scope": "openid",
+        "patient": mock::PATIENT,
+        "client_id": mock::CLIENT_ID,
+        "fhir_base": m.fhir_base(),
+        "token_endpoint": format!("{}/oauth2/v1/token", m.origin()),
+        "revocation_endpoint": format!("{}{path}", m.origin()),
+        "refreshed_at": 1
+    })
+    .to_string()
+}
+
+fn revocations(m: &Mock) -> usize {
+    m.requests()
+        .iter()
+        .filter(|(method, path)| method == "POST" && path == "/oauth2/v1/revoke")
+        .count()
+}
+
+/// Sign in, store the session, and sign out with `old` as the v0.2.x items.
+fn sign_out_with(m: &Mock, old: &OldItems) -> (MemoryStore, logout::SignedOut) {
+    let http = BlockingTransport::new().unwrap();
+    let signed_in = sign_in(m, &http);
+    let store = MemoryStore::default();
+    store.save(&signed_in).unwrap();
+    let result =
+        logout::sign_out(&http, &lock(), &store, old, "mock", mock::PATIENT).expect("sign out");
+    (store, result)
+}
+
+#[test]
+fn logout_revokes_and_removes_the_sign_in() {
+    let m = Mock::start(0);
+    let old = OldItems::default();
+    let (store, out) = sign_out_with(&m, &old);
+    assert!(out.credential_removed && out.revoked, "{out:?}");
+    assert!(out.left_behind.is_none());
+    assert!(store.load(&key("mock", mock::PATIENT)).unwrap().is_none());
+    assert_eq!(revocations(&m), 2, "the refresh and access tokens");
+}
+
+#[test]
+fn logout_revokes_and_removes_a_v0_2_sign_in_too() {
+    let m = Mock::start(0);
+    let old = OldItems::holding(old_sign_in(&m, "/oauth2/v1/revoke"));
+    let (_, out) = sign_out_with(&m, &old);
+    assert!(out.credential_removed && out.revoked, "{out:?}");
+    assert!(out.left_behind.is_none());
+    assert!(old.is_empty());
+    assert_eq!(revocations(&m), 4, "both items' refresh and access tokens");
+}
+
+#[test]
+fn logout_removes_a_v0_2_item_that_does_not_read_without_revoking_it() {
+    let m = Mock::start(0);
+    let old = OldItems::holding("not a sign-in".into());
+    let (_, out) = sign_out_with(&m, &old);
+    assert!(out.credential_removed && out.revoked, "{out:?}");
+    assert!(old.is_empty());
+    assert_eq!(revocations(&m), 2, "only the new item's tokens");
+}
+
+#[test]
+fn logout_is_not_revoked_when_a_v0_2_revocation_fails() {
+    let m = Mock::start(0);
+    let old = OldItems::holding(old_sign_in(&m, "/nowhere"));
+    let (_, out) = sign_out_with(&m, &old);
+    assert!(out.credential_removed, "{out:?}");
+    assert!(!out.revoked, "the v0.2.x revocation answered 404");
+    assert!(old.is_empty(), "the item is still deleted");
+}
+
+#[test]
+fn logout_leaves_the_patient_when_the_v0_2_item_cannot_be_read() {
+    let m = Mock::start(0);
+    let old = OldItems {
+        denied: true,
+        ..OldItems::holding(old_sign_in(&m, "/oauth2/v1/revoke"))
+    };
+    let (store, out) = sign_out_with(&m, &old);
+    let left = out.left_behind.as_ref().expect("the old item stays");
+    assert_eq!(left.exit_code(), 1);
+    assert!(
+        left.to_string().contains("v0.2.x sign-in at mock"),
+        "{left}"
+    );
+    assert!(!left.to_string().contains(mock::PATIENT), "{left}");
+    assert!(!out.credential_removed);
+    assert!(out.revoked, "the new item's tokens were revoked");
+    assert!(store.load(&key("mock", mock::PATIENT)).unwrap().is_none());
+    assert!(!old.is_empty());
 }

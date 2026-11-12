@@ -190,15 +190,9 @@ From the [Token Endpoint][token] page:
   provided to the authorize endpoint".
 
 A sign-in is one `pk_med_smart::SmartSession` in the Keychain, account
-`smart/<profile>/<patient>`. v0.2.x used `<profile>/<patient>`: such an item
-is no longer used for reads, and `auth logout` revokes its tokens and deletes
-it with the new one. When it cannot be read or deleted (a denied Keychain
-prompt), the patient stays in the index for another `auth logout`, the
-warning names the manual `security delete-generic-password` step, and the
-command exits with the error's code after its one document. `revoked` is
-true only when every revocation tried for the patient's items succeeded. It keeps a refresh token until a token answer carries a
-new one, and `tokens.obtained_at` is the last grant, so athena reports the
-90-day horizon as `signin_expires_at` from it. `pk_med_smart::Renewer` runs
+`smart/<profile>/<patient>`. It keeps a refresh token until a token answer
+carries a new one, and `tokens.obtained_at` is the last grant, so athena
+reports the 90-day horizon as `signin_expires_at` from it. `pk_med_smart::Renewer` runs
 every renewal under the family's refresh lock (`pk_cli_auth::refresh_lock`),
 so two processes never present one refresh token at once. A token that has
 lapsed is renewed before the first request; one athenahealth refuses (401)
@@ -215,6 +209,17 @@ endpoint "Terminates an end user's ... login session in the athenahealth login
 widget, which otherwise expires after 10 minutes of idle time ... terminating
 a login session will not invalidate any active access or refresh tokens"
 ([Additional OAuth Endpoints][oauth-extra]); athena has no use for it.
+
+v0.2.x stored a sign-in at `<profile>/<patient>`, which nothing else reads
+since v0.3.0, so `auth logout` revokes and deletes that item too (one that
+does not read as a sign-in is deleted unrevoked). Each row of
+`auth-logout/v1` has `credential_removed` and `revoked`, which is true only
+when every revocation tried for the patient's items succeeded. A patient whose
+v0.2.x item cannot be read or deleted (a denied Keychain prompt) is listed
+under `incomplete` with an `error`, not under `signed_out`. It stays in the
+index so a second `auth logout` retries it. The warning names the manual
+`security delete-generic-password` step, and the command exits with the
+error's code (1) after its one document.
 
 ## FHIR R4
 
